@@ -100,7 +100,7 @@
 | `balloon.max_inflate_ratio` | 最多回收 VM 声明内存比例 | `0.4` | 同 | 未设 | `0.4` | 未接线前该值无实际效果 |
 | `scheduling.affinity_enabled` | 四级机型亲和排序 | `true` | 无此键(`70eff85f` #430 新增) | 未设 | `true` | `ADR-heterogeneous`(**Proposed**);false 回落 free_vcpu 排序 |
 | `scheduling.spread_max_hosts_per_batch` | 单批最多铺开的 host 数 | `3` | `6`(#661)→ `3`(#689;example 此前无此键) | `3` | `3` | 每台 host 一条 SendCommand;限制扇出并保持单批可控 |
-| `scheduling.host_selection_score_floor` | 加权随机分数下限 | `0.39` | `0.25` | `0.39` | `0.39` | 0.25 在 2026-08-31 压测中让冷恢复集中到少数 host;0.39 让落点更扁平 |
+| `scheduling.host_selection_score_floor` | 加权随机分数下限 | `0.39` | `0.25` | `0.39` | `0.39` | 示例配置 `0.39`,代码缺省仍 `0.25`;0.25 在 2026-08-31 压测中让冷恢复集中到少数 host,0.39 让落点更扁平 |
 | `scheduling.family_order` | 机型优先序 | `["r8g","r7g","m8g","m7g"]` | 无此键(#430 新增) | 未设 | 同默认 | R 系先填满、M 系留安全余量;须与 `host.instance_types` 同序 |
 | `scheduling.mem_safety_floor_ratio` | 物理内存安全水位;实测 MemAvailable 低于此比例不接新租户 | `0.10` | 无此键(`70eff85f` #430 新增) | 未设 | `0.10` | `ADR-heterogeneous` 验收口径:满载压测每台剩余内存 ≥ 物理 10%、OOM 恒为 0 |
 | `scheduling.mem_check_ttl_sec` | 物理内存信号新鲜度 TTL | `300` | 无此键(#430 新增) | 未设 | `300` | 超期 fail-open,不用过期读数封锁 host |
@@ -146,28 +146,28 @@
 | `asg.max_capacity` | host ASG 最大台数 | ⚠️ `8` | 同 | ⚠️ `100` | **`320`** | `推算` `SPEC` 300 + 约 7% 滚动/故障冗余;默认 8 与生产 100 都装不下 10 万(见 § 19.1 ②) |
 | `asg.lifecycle_hook_timeout` | init-host 必须在此超时内完成 | `3600` | `600` → `1200` → `3600`(`c063e9b2` #488 · 08-13) | `3600` | `3600` | `实测` imported VPC + metal 场景 1200s 也不够;`preflight-region.sh` 门是 ≥2700 |
 | `asg.use_spot` | Spot 实例 | `false` | 同 | 未设 | `false` | metal + 有状态租户,Spot 中断代价高 |
-| `scaler.lifecycle_queue_enabled` | lifecycle FIFO 队列削峰(stop/delete 有序) | `true` | `false` | `true` | `true` | `实测` 同步路径下仅 40 并发 POST /tenants 就有 11 个永久卡 creating |
+| `scaler.lifecycle_queue_enabled` | lifecycle FIFO 队列削峰(stop/delete 有序) | `true` | `false` | `true` | `true` | 示例配置 `true`,代码缺省仍 `false`;`实测` 同步路径下仅 40 并发 POST /tenants 就有 11 个永久卡 creating |
 | `scaler.create_via_queue` | 建租户走 FIFO | `false` | 同 | `false` | `false` | 与 `dispatch.enabled=true` **互斥**(同 true 则 synth raise) |
-| `scaler.lifecycle_consumer_concurrency` | consumer 保留并发 | `75` | `10`(#215)→ `50`(`ae758f86` · 07-14) | `75` | `75` | 2026-08-31 起的生产基线;与 ESM MaximumConcurrency 相等 |
-| `scaler.lifecycle_max_concurrency` | lifecycle ESM MaximumConcurrency | `75` | `10` | `75` | `75` | host worker 仍为 20;超出部分在 agent 前排队并计入死线,synth 只告警 |
+| `scaler.lifecycle_consumer_concurrency` | consumer 保留并发 | `75` | `10`(#215)→ `50`(`ae758f86` · 07-14) | `75` | `75` | 示例配置 `75`(代码缺省 `50`),2026-08-31 起的生产基线;与 ESM MaximumConcurrency 相等 |
+| `scaler.lifecycle_max_concurrency` | lifecycle ESM MaximumConcurrency | `75` | `10` | `75` | `75` | 示例配置 `75`(代码缺省 `10`);host worker 仍为 20,超出部分在 agent 前排队并计入死线,synth 只告警 |
 | `scaler.interval_minutes` | scaler 巡检间隔 | `3` | 同 | 未设 | `3` | 无争议 |
 | `scaler.idle_timeout_minutes` | 空闲判定 | `10` | 同 | 未设 | `10` | 自动缩容当前在代码里硬关(`IDLE_RECLAIM_ENABLED=False`),该值当前无回收效果 |
-| `dispatch.enabled` | SQS 标准队列 + 装箱消费 | `true` | 无此键(`f77ecf4e` · 07-05 新增) | `true` | `true` | 10 万规模建租户必走装箱;`ADR-sqs-dispatch` 目标每分钟 6000 租户(100/s) |
-| `dispatch.mode` | manifest 载体 | `ddb` | 无此键 → `push`;`ddb` 载体 `f7250c95` · 07-06 加入 | `ddb` | **`ddb`** | 代码默认与示例配置都给 `ddb`(生产 `openclaw-api` / `openclaw-lifecycle-consumer` 的 `DISPATCH_MODE` 实测即 `ddb`),让 PutParameter 退出热路径;`push` 只作回退 |
-| `dispatch.esm_max_concurrency` | SQS Lambda ESM MaximumConcurrency | `25` | 无此键(`f77ecf4e` 新增即 10) | `25` | `25` | 生产基线;`AWS` 硬 range 2–1000 |
+| `dispatch.enabled` | SQS 标准队列 + 装箱消费 | `true` | 无此键(`f77ecf4e` · 07-05 新增) | `true` | `true` | 示例配置 `true`,代码缺省仍 `false`;10 万规模建租户必走装箱;`ADR-sqs-dispatch` 目标每分钟 6000 租户(100/s) |
+| `dispatch.mode` | manifest 载体 | `ddb` | 无此键 → `push`;`ddb` 载体 `f7250c95` · 07-06 加入 | `ddb` | **`ddb`** | 示例配置给 `ddb`(生产 `openclaw-api` / `openclaw-lifecycle-consumer` 的 `DISPATCH_MODE` 实测即 `ddb`),让 PutParameter 退出热路径;代码缺省仍 `push`,不填会回退 |
+| `dispatch.esm_max_concurrency` | SQS Lambda ESM MaximumConcurrency | `25` | 无此键(`f77ecf4e` 新增即 10) | `25` | `25` | 生产基线(代码缺省 `10`);`AWS` 硬 range 2–1000 |
 | `dispatch.batching_window_seconds` | 攒批窗口 | `2` | 无此键(`f77ecf4e`) | 未设 | `2` | `AWS` 标准队列支持 window ≤300s(FIFO 不支持);2s 窗口在 100/s 下攒 200 条 |
-| `dispatch.max_batch_size` | 单次 invoke 装箱租户数 | `30` | 无此键(`f77ecf4e`) | `30` | `30` | 等于 `DISPATCH_HOST_LAUNCH_CONCURRENCY`,一批一轮 |
+| `dispatch.max_batch_size` | 单次 invoke 装箱租户数 | `30` | 无此键(`f77ecf4e`) | `30` | `30` | 等于 `DISPATCH_HOST_LAUNCH_CONCURRENCY`,一批一轮(代码缺省 `500`) |
 | `dispatch.dlq_max_receive_count` | DLQ maxReceiveCount | `3` | 无此键 | 未设 | `3` | 一进 DLQ 即告警 `openclaw-dispatch-dlq-not-empty` |
-| `lifecycle.deadline_sec.{suspend,restore,restart,start,rebuild}` | 五档生命周期总死线 | `235` | `180` | `235` | `235` | 2026-08-29 起生产生效;SSM 参数是运行时载体,deploy 会按 config 重置 |
+| `lifecycle.deadline_sec.{suspend,restore,restart,start,rebuild}` | 五档生命周期总死线 | `235` | `180` | `235` | `235` | 2026-08-29 起生产生效;代码缺省仍 `180`,SSM 参数是运行时载体,deploy 会按 config 重置(不填即冲回 180) |
 | — | SSM managed nodes 配额 | 非 config 键 | — | — | 约 300 台 < `2400`/region | `AWS` 默认 managed nodes 2400/region,约 300 台有 8 倍余量 |
 
 ## 19.7 控制面 · 查询、健康与数据保护
 
 | 参数 | 意义 | 当前默认 | 曾经默认(commit) | 生产实际 | 10 万推荐值 | 推荐依据 |
 | --- | --- | --- | --- | --- | --- | --- |
-| `scaler.add_gsi_tenant_user` 等 4 个 GSI 门 | 规模化查询索引 | 全 `true` | 全 `false` | 全 `true` | 全 `true` | 新表默认建齐;已有表受 DynamoDB 一次 update 只能加 1 个 GSI 限制,仍须逐个部署 |
-| `tenant_query.enabled` | 规模化查询总开关 | `true` | 无此键(`adbb68c9` #388 · 07-27 新增) | `true` | `true` | 四个 GSI 默认建齐;已有表先跑 rollout 检查 |
-| `tenant_query.rootfs_backfill_complete` | rootfs 回填完成标记 | `true` | 无此键(#388) | `true` | `true` | 已有表启用 rootfs GSI 前仍须完成 backfill |
+| `scaler.add_gsi_tenant_user` 等 4 个 GSI 门 | 规模化查询索引 | 全 `true` | 全 `false` | 全 `true` | 全 `true` | 示例全 `true`(代码缺省全 `false`);已有表受 DynamoDB 一次 update 只能加 1 个 GSI 限制,仍须逐个部署 |
+| `tenant_query.enabled` | 规模化查询总开关 | `true` | 无此键(`adbb68c9` #388 · 07-27 新增) | `true` | `true` | 示例 `true`(代码缺省 `false`);须四个 GSI 全 ACTIVE,已有表先跑 rollout 检查 |
+| `tenant_query.rootfs_backfill_complete` | rootfs 回填完成标记 | `true` | 无此键(#388) | `true` | `true` | 示例 `true`(代码缺省 `false`);已有表启用 rootfs GSI 前仍须完成 backfill |
 | `tenant_stats.enabled` | 统计写入器 + 分钟调度 | `false` | 无此键(#388) | `false` | `true` | 10 万规模需要容量可观测;显式 scan-cost 门,开启前算成本 |
 | `health_check.interval_minutes` | 健康检查间隔 | `5` | 同 | 未设 | `5` | 约 300 台/5 min 无压力 |
 | `health_check.max_failures` | 连续失败判死 | `3` | 同 | 未设 | `3` | 无争议 |
@@ -217,7 +217,7 @@
 
 ### ③ lifecycle consumer 与 host worker 的生产取舍 · 中
 
-默认已改为 `75`。与 host 侧 `Mds.CommandWorkersLimit=20` 成对的规则仍在,超出时 synth 只告警。超出部分排在 agent 前面并计入死线。
+示例配置改为 `75`(代码缺省仍 `10`)。与 host 侧 `Mds.CommandWorkersLimit=20` 成对的规则仍在,超出时 synth 只告警。超出部分排在 agent 前面并计入死线。
 
 ### ④ 默认值曾被无关 MR 静默翻回旧值 · 中
 
@@ -441,4 +441,5 @@ profile 只写「场景决定项 + CDK 硬必填键」,不复制本章的调优�
 - SSM `SendCommand` 速率没有自助配额项,需要通过 AWS Support 申请。
 - 八档死线以 SSM 参数为运行时载体;`cdk deploy` 会按 config 值重置参数。
 - `lifecycle_max_concurrency=75` 对 host worker 20 是运维取舍;超出部分在 agent 前排队并计入死线。
-- 迁移提示:四个 GSI 门与 `tenant_query.enabled` 现在默认全 `true`。已有 `config.yml` 若显式把任一 `add_gsi_tenant_*` 写成 `false`,必须同时显式写 `tenant_query.enabled: false`,否则 synth 以「requires all four cumulative GSI gates」拒绝;已有表补索引仍受 DynamoDB 一次 update 只能加 1 个 GSI 的限制。
+- 上游代码改动只有两处:`core/create_deadline.py` 的六个执行/排队预算字面量(与生产 Lambda 代码逐字节一致)和 `lambdas.py` 把并发闸从 raise 改为 WARNING。其余生产基线全部由 `config.yml.example` 携带,CDK 代码缺省值未动;不复制示例配置直接部署,行为仍是旧缺省。
+- 迁移提示:`config.yml.example` 把四个 GSI 门与 `tenant_query.enabled` 全写成 `true`。已有表照此部署仍受 DynamoDB 一次 update 只能加 1 个 GSI 的限制:先逐个开 `add_gsi_tenant_*`、等 ACTIVE,最后再开 `tenant_query.enabled`;任一 GSI 门为 `false` 时 `tenant_query.enabled` 必须同为 `false`,否则 synth 以「requires all four cumulative GSI gates」拒绝。

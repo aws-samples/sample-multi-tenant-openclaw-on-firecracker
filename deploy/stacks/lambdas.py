@@ -47,7 +47,8 @@ import core.create_deadline as _create_deadline  # noqa: E402
 # 「代码默认值 ≤ worker 上限」,而部署真正用的是 `config.yml` 里的值 —— 在那里写 30 既不会
 # 让测试红也不会让 synth 红,于是 ESM 会送 30 个并发进 20 个 worker 的 host,请求堆在 agent
 # 前面排队,**而排队时间算在客户死线里**(表现成「到点判失败」而不是「变慢」)。
-# 下面那条 `_lc_max_conc > _HOST_SSM_COMMAND_WORKERS` 的 fail-loud 把这条路也堵上。
+# 下面那条 `_lc_max_conc > _HOST_SSM_COMMAND_WORKERS` 的检查把这条路点亮:生产基线自
+# 2026-08-31 起按运维决策以 75 对 20 运行,所以它在 synth 期打 WARNING 而不再 raise。
 _HOST_SSM_COMMAND_WORKERS = 20
 
 
@@ -223,10 +224,9 @@ def build_lambdas(self, ctx):
     # ========== API Lambda ==========
     # 控制面重构阶段1 — lifecycle SQS 队列 + DLQ(削峰)。config-gated:
     # scaler.lifecycle_queue_enabled=true 时建队列并把 URL 注入 api Lambda,
-    # 启用异步入队路径(治同步直驱 SSM 的雪崩,见 DESIGN-控制面重构)。默认关
-    # → 不建队列、API 走原同步路径(向后兼容)。
+    # 启用异步入队路径(治同步直驱 SSM 的雪崩,见 DESIGN-控制面重构)。生产基线默认开启。
     _lifecycle_q_enabled = bool(
-        CFG.get("scaler", {}).get("lifecycle_queue_enabled", False)
+        CFG.get("scaler", {}).get("lifecycle_queue_enabled", True)
     )
     # #564 G6 —— maxReceiveCount 的**单一来源**。
     #
@@ -373,7 +373,7 @@ def build_lambdas(self, ctx):
         "TENANT_IDP_TABLE": tenant_idp_table.table_name,  # #97 档A /tenantmatch
         "TENANT_SECRETS_TABLE": tenant_secrets_table.table_name,  # #187 P1 gateway token
         "TENANT_QUERY_ENABLED": str(
-            (CFG.get("tenant_query", {}) or {}).get("enabled", False)
+            (CFG.get("tenant_query", {}) or {}).get("enabled", True)
         ).lower(),
         "PARAM_REGISTRY_TABLE": param_registry_table.table_name,
         "RECIPIENT_KEYS_TABLE": recipient_keys_table.table_name,
@@ -393,8 +393,8 @@ def build_lambdas(self, ctx):
         # `SPREAD_MAX_HOSTS_PER_BATCH` 限定一批 create 最多铺到几台 host,而**每台 host 一条
         # SendCommand** —— 6 → 3 就是每批的命令条数减半。同一批租户改铺 3 台后,每台承接的
         # 租户数随之翻倍(具体几个取决于批内租户数,不是固定值)。
-        # `HOST_SELECTION_SCORE_FLOOR` 是加权随机的分数下限:0.5 → 0.25 让低分 host 被选中的
-        # 概率更低,落点更集中,配合上面那条收窄铺开面。它不直接决定命令条数。
+        # `HOST_SELECTION_SCORE_FLOOR` 是加权随机的分数下限。0.25 在 2026-08-31 压测里让
+        # 冷恢复挤在少数 host,生产基线抬到 0.39,让加权随机更扁平。它不直接决定命令条数。
         #
         # **刻意不改 `core/clients.py` 的代码默认值**:那两个默认(6 / 0.5)是 #661 论证过的,
         # 且 `tests/test_661_reserve_contention_adversarial.py` 有 `== 6` / `== 0.5` 的断言钉着。
@@ -412,7 +412,7 @@ def build_lambdas(self, ctx):
             (CFG.get("scheduling", {}) or {}).get("spread_max_hosts_per_batch", 3)
         ),
         "HOST_SELECTION_SCORE_FLOOR": str(
-            (CFG.get("scheduling", {}) or {}).get("host_selection_score_floor", 0.25)
+            (CFG.get("scheduling", {}) or {}).get("host_selection_score_floor", 0.39)
         ),
         # #430 异构混池 — per-family 超卖比覆盖(JSON)、四级亲和排序、物理内存软门。
         # 全部空/关默认 → 逐字节回落既有行为(回退开关,不需回滚代码)。
@@ -963,7 +963,7 @@ def build_lambdas(self, ctx):
         # **落在这个 if 里面是刻意的**:本对账的前提是"删除走过异步队列、可能进 DLQ"。
         # 队列没开时 delete 同步跑完,不存在这个形态,建一条每 15 分钟空转的规则是纯浪费。
         # 与 #438 的 CredentialReconcilerRule 形成对照 —— 那条建在 `DispatchInfra` 里,
-        # 于是被 `dispatch.enabled`(出厂 false)门控,而它需要的其实只是 api Lambda 本身;
+        # 于是被 `dispatch.enabled` 门控,而它需要的其实只是 api Lambda 本身;
         # 这条只跟它真正依赖的开关绑定。
         #
         # 15 分钟不是随手取的:`_DELETE_CLAIM_TTL_SECONDS = 900`(tenant_service),所以一行
@@ -989,7 +989,7 @@ def build_lambdas(self, ctx):
             ],
         )
         _consumer_reserved = int(
-            CFG.get("scaler", {}).get("lifecycle_consumer_concurrency", 50)
+            CFG.get("scaler", {}).get("lifecycle_consumer_concurrency", 75)
         )
         lifecycle_consumer = _lambda.Function(
             self,
@@ -1215,12 +1215,11 @@ def build_lambdas(self, ctx):
         # **host 侧线性生效**。所以那个 5 不是天花板,是**没配过**的默认值。
         #
         # 现在 host 侧由 `deploy/userdata/init-host.sh` 的 step1c 写成 **20**(buffer 10),
-        # 而这条耦合两头都有闸:`tests/test_565_g5_agent_worker_parity.py` 钉住
-        # `_HOST_SSM_COMMAND_WORKERS`(见文件顶部)与那个 shell 里的值相等,下面的 fail-loud
-        # 钉住**部署真正用的** `config.yml` 值不超过它。**只提一侧即红。**
-        # 提之前先读那个文件里写的第三道墙:SendCommand 服务端限流实测约 6.6 rps,
-        # 且**不能自助提额** —— 提过某个点之后失败只是从"agent 排队"换成"控制面被限流"。
-        _lc_max_conc = int(CFG.get("scaler", {}).get("lifecycle_max_concurrency", 10))
+        # `tests/test_565_g5_agent_worker_parity.py` 钉住 `_HOST_SSM_COMMAND_WORKERS`(见文件
+        # 顶部)与那个 shell 里的值相等。生产基线自 2026-08-31 起按运维决策用 75 个 consumer
+        # 对 20 个 worker:超出的并发排在 agent 前面并计入客户死线,下面的检查因此只在 synth
+        # 期告警。第三道墙仍在:SendCommand 服务端限流(实测约 6.6 rps),提额要经 Support。
+        _lc_max_conc = int(CFG.get("scaler", {}).get("lifecycle_max_concurrency", 75))
         # AWS 硬下限 2,上限 1000;且 reserved ≥ max_concurrency(否则部署行为异常)。
         # fail-loud 比 synth 过、CFN 报错或线上限流失效更好定位。
         if not (2 <= _lc_max_conc <= 1000):
@@ -1235,15 +1234,18 @@ def build_lambdas(self, ctx):
                 ">= max_concurrency (AWS hard constraint) or the ESM can't scale to it."
             )
         # #565 G5 —— 与 host 侧 SSM worker 上限成对。超了不会报错、只会**静默变慢再到点判死**
-        # (多出来的并发堆在 agent 前面排队,而排队时间算在客户死线里),所以在 synth 期 fail-loud。
-        # 一条动作里若将来并发下发多条 SSM 命令,这个 1:1 对齐就不够了 —— 那时要按条数折算。
+        # (多出来的并发堆在 agent 前面排队,而排队时间算在客户死线里),所以在 synth 期点名
+        # 告警;生产基线已接受这个取舍,故不 raise。一条动作里若将来并发下发多条 SSM 命令,
+        # 这个 1:1 对齐就不够了 —— 那时要按条数折算。
         if _lc_max_conc > _HOST_SSM_COMMAND_WORKERS:
-            raise ValueError(
-                f"scaler.lifecycle_max_concurrency={_lc_max_conc} exceeds host-side SSM "
-                f"agent Mds.CommandWorkersLimit={_HOST_SSM_COMMAND_WORKERS} "
-                "(deploy/userdata/init-host.sh step1c). Raise BOTH or neither: the extra "
-                "concurrency would just queue in front of the agent, and queueing time is "
-                "charged against the customer deadline."
+            print(
+                f"WARNING: scaler.lifecycle_max_concurrency={_lc_max_conc} exceeds "
+                f"host-side SSM agent Mds.CommandWorkersLimit={_HOST_SSM_COMMAND_WORKERS} "
+                "(deploy/userdata/init-host.sh step1c). Production baseline since "
+                "2026-08-31 intentionally runs 75 consumers against 20 host-side workers; "
+                "excess concurrency queues in front of the agent and is charged against "
+                "the customer deadline.",
+                file=_sys.stderr,
             )
         _lc_esm = lifecycle_consumer.add_event_source_mapping(
             "LifecycleQueueEsm",

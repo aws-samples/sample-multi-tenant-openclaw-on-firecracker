@@ -51,10 +51,12 @@ from constructs import Construct
 
 # 默认值(SPEC/specs/sqs-dispatch/interfaces.md 第 22-28 行 config.yml 段)。
 _DEFAULTS: Dict[str, Any] = {
-    "mode": "push",
-    "esm_max_concurrency": 10,
+    # 默认 ddb(生产基线,api / lifecycle-consumer 的 DISPATCH_MODE 实测都是 ddb);
+    # push 只作回退。
+    "mode": "ddb",
+    "esm_max_concurrency": 25,
     "batching_window_seconds": 2,
-    "max_batch_size": 500,
+    "max_batch_size": 30,
     "dlq_max_receive_count": 3,
 }
 
@@ -79,7 +81,7 @@ def validate_no_double_enqueue(cfg: Dict[str, Any]) -> None:
     只测校验逻辑本身;跟 deploy/lib/guardrail_props.py 里 build_guardrail_kwargs
     的可测性理念同款。
     """
-    dispatch_enabled = bool((cfg.get("dispatch", {}) or {}).get("enabled", False))
+    dispatch_enabled = bool((cfg.get("dispatch", {}) or {}).get("enabled", True))
     create_via_queue = bool(
         (cfg.get("scaler", {}) or {}).get("create_via_queue", False)
     )
@@ -101,7 +103,7 @@ class DispatchInfra(Construct):
     使用方式(stack.py 里):
 
         _dispatch_cfg = (CFG.get("dispatch", {}) or {})
-        if _dispatch_cfg.get("enabled", False):
+        if _dispatch_cfg.get("enabled", True):
             validate_no_double_enqueue(CFG)
             dispatch = DispatchInfra(
                 self, "Dispatch",
@@ -142,8 +144,9 @@ class DispatchInfra(Construct):
         }
 
         # 校验:mode 只允许 push|pull|ddb(spec 契约)。fail-loud 优于 synth 出错误资源。
-        # push=聚合 SSM+ParamStore 分片(回退);pull=host-agent 轮询自取(二期);
-        mode = str(merged.get("mode", "push")).lower()
+        # 默认 ddb(生产基线);push=聚合 SSM+ParamStore 分片(回退);
+        # pull=host-agent 轮询自取(二期)。
+        mode = str(merged.get("mode", "ddb")).lower()
         if mode not in ("push", "pull", "ddb"):
             raise ValueError(
                 f"dispatch.mode={merged.get('mode')!r} invalid; must be 'push', 'pull' "
@@ -243,19 +246,18 @@ class DispatchInfra(Construct):
         # ARN 里含 "openclaw-dispatch" 就走 consumers.dispatch。
         #
         # 关键参数(interfaces.md 契约):
-        # · batch_size = max_batch_size (默认 500)——SQS Lambda ESM 上限 10000,标准
-        #   队列可以吃到 10000,但装箱一批太大会撞 executionTimeout 推导上限
-        #   (SPEC L118),保守 500 作默认。
+        # · batch_size = max_batch_size (默认 30)——30 = `DISPATCH_HOST_LAUNCH_CONCURRENCY`,
+        #   一批一轮,`scripts/checks/create-deadline-config.py` 的 BatchSize 约束由此转绿。
         # · max_batching_window = batching_window_seconds(默认 2s)——攒批降 Lambda
         #   冷启和 SSM 每命令开销。
         # · report_batch_item_failures = True——装箱部分失败时只回队 unplaced,
         #   已放下的租户 ack 掉(SPEC L93 的 batchItemFailures 契约必需)。
-        # · ScalingConfig maxConcurrency = esm_max_concurrency(默认 10)——治
+        # · ScalingConfig maxConcurrency = esm_max_concurrency(默认 25)——治
         #   "consumer 打爆 SSM/PutParameter" 的核心限流阀,同时也守护 andon 急停时
         #   不会因队列积压瞬间起 100 个 consumer 实例把 andon read 拖挂。
-        max_conc = int(merged.get("esm_max_concurrency", 10))
+        max_conc = int(merged.get("esm_max_concurrency", 25))
         batch_window = int(merged.get("batching_window_seconds", 2))
-        batch_size = int(merged.get("max_batch_size", 500))
+        batch_size = int(merged.get("max_batch_size", 30))
         # 参数合规性(fail-loud 比 synth 后 CFN 报错更好定位)
         if not (2 <= max_conc <= 1000):
             raise ValueError(

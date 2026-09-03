@@ -141,21 +141,24 @@ DEADLINE_ACTIONS = (
     ACTION_DELETE,
 )
 """八个操作。客户表格最终版给了五档(create/suspend/restore/手动备份/delete),
-客户 2026-08-21 追加 `rebuild` 与 `restart` 按 180s 档;#604 后续把 `start` 加入
-`restart` 同档 —— 理由:同一条通道、同为不含数据步骤的动作。"""
+客户 2026-08-21 追加 `rebuild` 与 `restart`;#604 后续把 `start` 加入 `restart`
+同档。2026-08-29 起 suspend/restore/restart/start/rebuild 的生产基线为 235s。"""
 
 _DEFAULT_DEADLINE_SEC = {
     ACTION_CREATE: DEADLINE_TOTAL_SEC,  # 180,#562 已落地的那条
-    ACTION_SUSPEND: 180,
-    ACTION_RESTORE: 180,
-    ACTION_RESTART: 180,
-    ACTION_START: 180,  # 与 restart 同档:同一条通道、同为不含数据步骤的动作
-    ACTION_REBUILD: 180,
+    ACTION_SUSPEND: 235,
+    ACTION_RESTORE: 235,
+    ACTION_RESTART: 235,
+    ACTION_START: 235,  # 与 restart 同档:同一条通道、同为不含数据步骤的动作
+    ACTION_REBUILD: 235,
     ACTION_BACKUP: 600,
     ACTION_DELETE: 600,
 }
 """客户表格最终版的值。**这些不是"兜底猜测"而是权威默认** —— 区别很重要,见
-`deadline_sec_for` 里对「不许拿不到就用默认」那条要求的处置。"""
+`deadline_sec_for` 里对「不许拿不到就用默认」那条要求的处置。
+
+五档 235s 是 2026-08-29 起生效的生产基线;SSM 已是 235,代码默认跟上,避免 CDK 建参数时
+把运行时值重置回 180。"""
 
 _ENV_PREFIX = "LIFECYCLE_DEADLINE_SEC_"
 
@@ -213,7 +216,8 @@ BACKUP_TERM_GRACE_SEC = 60
 **为什么它必须进预算**:不留这段宽限就只能 SIGKILL,而那会掐断 EXIT trap 里的 resume →
 客户 VM 永久留在 Paused,且 reaper 救不了它(判 `fc_alive` 是进程存活,Paused 进程是活的)。
 `backup-data.sh` 自己把这个后果评为「比丢一次备份严重:丢备份下轮会重来,而 Paused 不会
-自己好」。所以任何含同步备份的档,它的 backup 步预算都必须 **> 60**。
+自己好」。suspend/rebuild 的控制面预算按生产基线记 60s;backup Lambda 会识别该预算不大于
+宽限并回落到自己的安全上界,见 `_EXEC_STEPS` 注释。
 """
 
 STOP_VM_LOCK_CONTENTION_SEC = 17  # stop-vm.sh:230 flock -w 2 + :266 flock -w 15
@@ -239,29 +243,31 @@ STOP_VM_WORST_SEC = (
 _EXEC_STEPS: Dict[str, Any] = {
     # create 不动:128s 已由 `EXEC_BUDGET_SEC` 从 batch/slots/per-vm 论证过(#562)。
     ACTION_CREATE: (("dispatch-ssm", EXEC_BUDGET_SEC),),
-    # suspend = 无条件同步备份 + stop-vm。备份实测 6.6s/9.5MB → 90s(13.6×,给大盘留量);
-    # stop-vm 的下界不能按 6.0s 典型值取倍数:flock -w / timeout 都是设计上会走到的
-    # 有界路径,不是异常。50 = STOP_VM_WORST_SEC(46) + 4s 余量。
-    ACTION_SUSPEND: (("backup", 90), ("stop-vm", 50)),
-    # restore = 冷恢复 launch(sync=True)。实测恢复 16s → 120s(7.5×);它含 S3 下载+解密+
-    # 解压+e2fsck,是八档里单步最重的一个,所以系数比 stop-vm 那种纯本地操作低。
-    ACTION_RESTORE: (("launch-vm", 120),),
+    # suspend = 无条件同步备份 + stop-vm。backup 60 = BACKUP_TERM_GRACE_SEC;
+    # `deploy/lambda/backup/handler.py::backup_tenant` 会把预算 ≤ 宽限判为无效,回落
+    # `_DEFAULT_SSM_BUDGET_SEC`(300s)并打 `[#565]` 日志。因此控制面按 60s 记预算,
+    # host 侧备份脚本实际墙钟上界是 300s;2026-08-31 生产日志已观测到该回落,此不一致已接受。
+    # stop-vm 46 = STOP_VM_WORST_SEC,余量 0,刻意为之(原值 90/50)。
+    ACTION_SUSPEND: (("backup", 60), ("stop-vm", 46)),
+    # restore 60 = 实测冷恢复基线 16s × 3.75;在 235s 死线下用执行段换 175s 排队容忍
+    # (原值 120)。
+    ACTION_RESTORE: (("launch-vm", 60),),
     # restart = 一条组命令 `stop-vm && sleep 2 && launch-vm`(:7386-7392),**没有备份**。
     # 从已测分量推导:stop 6.0s + 2s + launch 6.48s ≈ 14.5s → 75s(5.2×)。
     # 它与 start 都不含数据相关步骤;restart 还多了 stop+sleep,所以执行段是 75s、排队段
-    # 105s。**不给它 120s 是刻意的**:多给执行段就是少给排队段,而它本来就不需要那么多。
+    # 160s。保留 75s 是刻意的:多给执行段就是少给排队段,而它本来就不需要那么多。
     ACTION_RESTART: (("stop+launch", 75),),
     # start 只跑 launch,基准 6.48s;组命令还含 host_script_self_heal(可能从 S3 拉脚本,
     # 一次网络往返)与幂等 DNAT,所以给 60s(9.3×)。比 restart 的系数更宽是刻意的,
     # 不是抄漏。
     ACTION_START: (("launch-vm", 60),),
-    # ⚠ **含同步备份的三档(suspend/rebuild/delete)的 backup 步一律 90s,不是"按需分配"。**
-    # 那 90 = `BACKUP_TERM_GRACE_SEC`(60)+ 脚本自己的墙钟额度(30)。60 不是我拍的:它是
-    # host-agent 的 `_BACKUP_TERM_GRACE_SEC`(`deploy/userdata/host-agent.py:1104`),按
-    # `backup-data.sh` 的 EXIT trap 里 resume 的最坏耗时 35s 抬上来的,并有 parity 测试锁着。
+    # ⚠ **delete 的 backup 步仍是 90 = `BACKUP_TERM_GRACE_SEC`(60)+ 脚本自己的墙钟额度(30)。**
+    # 60 不是拍的:它是 host-agent 的 `_BACKUP_TERM_GRACE_SEC`(`deploy/userdata/host-agent.py:1104`),
+    # 按 `backup-data.sh` 的 EXIT trap 里 resume 的最坏耗时 35s 抬上来的,并有 parity 测试锁着。
     # backup 侧把脚本包成 `timeout --signal=TERM --kill-after=60 30`,于是这一步的真实墙钟
-    # 上界就是 90 —— **预算第一次真的界住了 host,而不只是界住控制面的轮询。**
-    # 详见 `deploy/lambda/backup/handler.py` 那处 `timeout` 包装旁边的说明。
+    # 上界就是 90 —— **预算真的界住了 host,而不只是界住控制面的轮询**(详见
+    # `deploy/lambda/backup/handler.py` 那处 `timeout` 包装旁边的说明)。
+    # suspend/rebuild 按生产基线取 60:预算 ≤ 宽限时 handler 回落 300s 兜底,见 suspend 注释。
     # rebuild = **强制同步备份** + `rebuild-vm.sh`。
     #
     # ⚠ **那次备份是 issue 分析表漏掉的一项。** issue 只写了 rebuild 有一个 300s 的
@@ -275,17 +281,13 @@ _EXEC_STEPS: Dict[str, Any] = {
     # **重命名,O(1)**,不随盘大小涨。预算下界不能按 6.0s 典型 stop 值取倍数:
     # flock -w / timeout 都是设计上会走到的有界路径,不是异常。
     # 66 = STOP_VM_WORST_SEC(46) + O(1) rename + 20s(launch 实测 6.48s 的 3×)。
-    # 备份必须先拿够 90(它装不下比 90 更小的数,见上面那段:60 宽限是硬的),
-    # rebuild-vm 再拿 66。**第一版分成 55+65 是错的** —— 55 装不下 60s 宽限,
-    # 于是那一步的墙钟上界压根界不住,预算又变回纸面的。
-    #
-    # **rebuild 的 queue 只有 24s,是八档里最紧的一个**:同一个 180s 死线里必须先给
-    # backup 90s、再给 rebuild-vm 66s;把异步重试余量压到 24s 是本轮对齐最坏等待的代价。
-    # 后果如实写进契约文档:
-    # 一个能 suspend 成功的大盘租户,可能 rebuild 失败。**这不是取舍失误,是 180s 装不下
-    # 两个数据相关步骤这件事本身**;要它更宽只能抬死线或把备份异步化(都不在本轮范围)。
-    ACTION_REBUILD: (("backup", 90), ("rebuild-vm", 66)),
-    # delete = 同步备份 + host 原子删除。备份同 suspend 取 90;host 删除实测注销 12.2s →
+    # 备份步要真正界住 host 必须 > 60 宽限(**第一版分成 55+65 因此被打回**:55 装不下 60s
+    # 宽限,那一步的墙钟上界压根界不住)。生产基线的 60 走的是 handler 的 300s 回落(见 suspend);
+    # rebuild-vm 再拿 66。原值 90+66=156、queue 24 是 180s 死线下八档里最紧的一档,235s 死线
+    # 下 queue 放宽到 109。一个能 suspend 成功的大盘租户仍可能 rebuild 失败 —— 两个数据相关
+    # 步骤挤在同一个死线里这件事本身没变,要更宽只能抬死线或把备份异步化。
+    ACTION_REBUILD: (("backup", 60), ("rebuild-vm", 66)),
+    # delete = 同步备份 + host 原子删除。备份仍取 90;host 删除实测注销 12.2s →
     # 120s(10×)。600s 档给了排队段 390s 的余量,是八档里最宽裕的。
     ACTION_DELETE: (("backup", 90), ("host-delete", 120)),
     # 手动备份走通道 D:**异步**,不受调用侧 `read_timeout` 约束(那条只管同步 invoke)。
@@ -339,15 +341,17 @@ def intake_sec(action: str) -> int:
 
 _QUEUE_SEC: Dict[str, int] = {
     ACTION_CREATE: QUEUE_BUDGET_SEC,   # 50,#562 已论证
-    ACTION_SUSPEND: 40,
-    ACTION_RESTORE: 60,
-    ACTION_RESTART: 105,               # stop+launch 75s,剩余 105s 给排队
-    ACTION_START: 120,                 # 恒等式约束:0 + 120 + 60 = 180,必须显式写值
-    ACTION_REBUILD: 24,                # 通道 C:这一段是「留给 AWS 异步重试的余量」
+    ACTION_SUSPEND: 129,
+    ACTION_RESTORE: 175,
+    ACTION_RESTART: 160,
+    ACTION_START: 175,
+    ACTION_REBUILD: 109,
     ACTION_BACKUP: 300,                # 通道 D:同上
     ACTION_DELETE: 390,                # 600s 档,八档里最宽裕
 }
 """排队段(通道 C/D 是「留给 AWS 异步重试的余量」)。
+
+五档 235s 的 queue 均按 `235 - exec` 推导,受理段为 0。
 
 **为什么写成显式的表而不是 `死线 - 受理 - 执行`。** 第一版是算出来的,结果那让
 `assert_all_budgets_consistent()` 里「三段之和 = 死线」这条检查变成**空操作** —— 改坏执行段
@@ -548,8 +552,8 @@ import `core.clients`)。读取实现留在 `fence_config`,**默认值只有这�
 **客户等待不再由租约长度决定**,这是 #680 的关键变化:客户带同一 `client_token` 重试会立刻
 拿到 `202 + retry_after_sec`(不必等租约过期),所以把租约放到 240 不会让客户多等 —— 它只
 影响「真正重做」的时机。因此「配短一点让客户早点能重做」这个动机在 #680 之后基本消失,而
-`FENCE_LEASE_MIN_SEC` 会把低于 210 的取值一律拒掉:**这个参数的用途是往上调**(超大盘租户
-的备份可能吃满 90s 预算),不是往下调。
+`FENCE_LEASE_MIN_SEC` 会把低于 210 的取值一律拒掉:**这个参数的用途是往上调**(delete
+备份可能吃满 90s 预算),不是往下调。
 
 per-action 分档(每个动作按自己的 `exec_sec` 取租约)是更彻底的解,留待后续:全局单值必须按
 最长的那档取,于是 restart(执行段仅 75s)也跟着拿 240s 租约。这只影响「过期后才能真正重做」
@@ -576,7 +580,7 @@ FENCE_LEASE_MIN_SEC = max(exec_sec(_a) for _a in _FENCE_LEASE_COVERED_ACTIONS)
 **从 `_EXEC_STEPS` 推导,不写字面量** —— 与本模块「八档都有权威值且全部从 `_EXEC_STEPS`
 推导」同一条纪律:下界抄成常量,`_EXEC_STEPS` 一改就静默失配。当前取值 = `delete` 的执行段
 总额 **210s**(备份 90 + host 删除 120),它是四个 fenced 动作里最大的
-(suspend 140、restart 75、rebuild 156)。
+(suspend 106、restart 75、rebuild 126)。
 
 ## 为什么下界是「执行段预算」而不是实测 lease_hold
 
@@ -746,7 +750,7 @@ def deadline_at_for(action: str, accepted_epoch: int) -> int:
     """从受理时刻算出该操作的死线绝对时间戳 —— **env/默认口径的零 boto3 原语**。
 
     计时起点 = **API 受理时刻**,与 #562 一致:上游业务侧在死线之上各留 30s 缓冲
-    (180 档→210s、600 档→630s),而缓冲只有在两边起点对齐时才是真缓冲。
+    (create 180→210s、五档 235→265s、600 档→630s),而缓冲只有在两边起点对齐时才是真缓冲。
 
     ⚠ **生产路径不要调这个,调 `core.deadline_config.deadline_epoch_for()`。**
     #564 G5 之后死线秒数的运行时载体是 SSM Parameter Store,而本模块必须保持零 boto3

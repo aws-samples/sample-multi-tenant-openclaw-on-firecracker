@@ -62,13 +62,10 @@ def build_storage(self, ctx):
         ),
         projection_type=dynamodb.ProjectionType.ALL,
     )
-    # DynamoDB 硬限制:一次 update 只能加/删 1 个 GSI。现网表已有 gsi_owner
-    # (ACTIVE),栈漂移导致 CFN 想一次补 gsi_owner+gsi_tenant_user 两个 → 报
-    # "Cannot perform more than one GSI creation in a single update"(2026-06-29
-    # deploy 实撞)。分两步:本次 deploy 只对齐 gsi_owner;gsi_tenant_user 由
-    # config 开关 add_gsi_tenant_user=true 在**下一次单独 deploy** 加(per-user
-    # 舰队反查 GET /users/{id}/* 用,缺它这些端点降级但不阻塞核心)。
-    if (CFG.get("scaler", {}) or {}).get("add_gsi_tenant_user", False):
+    # DynamoDB 硬限制:已有表一次 update 只能加/删 1 个 GSI;新表可在创建时一次建齐。
+    # 默认建齐四个索引是生产基线;tenant_query.enabled 默认 true 依赖它们。已有表仍由
+    # `scripts/checks/tenant-query-rollout.py` 兜住逐个加索引的限制。
+    if (CFG.get("scaler", {}) or {}).get("add_gsi_tenant_user", True):
         tenants_table.add_global_secondary_index(
             index_name="gsi_tenant_user",
             partition_key=dynamodb.Attribute(
@@ -76,7 +73,7 @@ def build_storage(self, ctx):
             ),
             projection_type=dynamodb.ProjectionType.ALL,
         )
-    if (CFG.get("scaler", {}) or {}).get("add_gsi_tenant_host", False):
+    if (CFG.get("scaler", {}) or {}).get("add_gsi_tenant_host", True):
         tenants_table.add_global_secondary_index(
             index_name="gsi_host",
             partition_key=dynamodb.Attribute(
@@ -84,7 +81,7 @@ def build_storage(self, ctx):
             ),
             projection_type=dynamodb.ProjectionType.ALL,
         )
-    if (CFG.get("scaler", {}) or {}).get("add_gsi_tenant_status", False):
+    if (CFG.get("scaler", {}) or {}).get("add_gsi_tenant_status", True):
         tenants_table.add_global_secondary_index(
             index_name="gsi_status",
             partition_key=dynamodb.Attribute(
@@ -92,7 +89,7 @@ def build_storage(self, ctx):
             ),
             projection_type=dynamodb.ProjectionType.ALL,
         )
-    if (CFG.get("scaler", {}) or {}).get("add_gsi_tenant_rootfs", False):
+    if (CFG.get("scaler", {}) or {}).get("add_gsi_tenant_rootfs", True):
         tenants_table.add_global_secondary_index(
             index_name="gsi_rootfs_version",
             partition_key=dynamodb.Attribute(

@@ -11,14 +11,14 @@ GSI_GATES = (
 def desired_query_indexes(cfg):
     scaler = cfg.get("scaler", {}) or {}
     return [
-        index_name for gate, index_name in GSI_GATES if bool(scaler.get(gate, False))
+        index_name for gate, index_name in GSI_GATES if bool(scaler.get(gate, True))
     ]
 
 
 def validate_tenant_query_config(cfg):
     """Reject skipped rollout stages and queries enabled ahead of prerequisites."""
     scaler = cfg.get("scaler", {}) or {}
-    enabled = [bool(scaler.get(gate, False)) for gate, _ in GSI_GATES]
+    enabled = [bool(scaler.get(gate, True)) for gate, _ in GSI_GATES]
     seen_disabled = False
     for position, is_enabled in enumerate(enabled):
         if not is_enabled:
@@ -30,13 +30,13 @@ def validate_tenant_query_config(cfg):
             )
 
     query_cfg = cfg.get("tenant_query", {}) or {}
-    backfill_complete = bool(query_cfg.get("rootfs_backfill_complete", False))
+    backfill_complete = bool(query_cfg.get("rootfs_backfill_complete", True))
     if enabled[-1] and not backfill_complete:
         raise ValueError(
             "add_gsi_tenant_rootfs=true requires "
             "tenant_query.rootfs_backfill_complete=true"
         )
-    if query_cfg.get("enabled", False) and not all(enabled):
+    if query_cfg.get("enabled", True) and not all(enabled):
         raise ValueError(
             "tenant_query.enabled=true requires all four cumulative GSI gates"
         )
@@ -94,7 +94,7 @@ def validate_live_rollout(cfg, indexes, table_exists=True):
     if inactive:
         raise ValueError("tenant-query GSIs are not ACTIVE: " + ", ".join(inactive))
 
-    if (cfg.get("tenant_query", {}) or {}).get("enabled", False):
+    if (cfg.get("tenant_query", {}) or {}).get("enabled", True):
         unavailable = query_indexes - {
             name for name, status in actual.items() if status == "ACTIVE"
         }

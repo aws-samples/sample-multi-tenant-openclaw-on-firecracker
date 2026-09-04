@@ -66,13 +66,14 @@ host:
   #   M 系 4.0/2.0 = 2.0 → 统一 1:4 时 M 系多出的 CPU 槽内存跟不上,会搁浅
   #                        (m8g 189 vcpu / m7g 125 vcpu),这是【已接受的代价】,
   #                        由 openclaw_host_stranded_vcpu 指标观测,阈值需相应放宽。
-  # 从 6.0 降到 4.0 是【收紧】放行条件:6.0 的 570 槽是虚容量(内存只够 383),
-  # 真实上限一直由内存决定。r8g 仍满足 380/台,不减容。
-  cpu_overcommit_ratio: 4.0
-  # 150%(374 个 1c2G 塞进 384GB),物理内存打满到 0G。
-  # 物理层防护改由 scheduling.mem_safety_floor_ratio 用 host 自报的实测
-  # MemAvailable 兜底(两维职责分离:账本防超卖,实测防 OOM),不再靠记账超卖赌 balloon。
-  mem_overcommit_ratio: 1.0
+  # 示例值取 2026-09 生产基线 6.0 / 2.0(两个 Lambda env 实测即此值)。
+  # ⚠ 保守值是 4.0 / 1.0:按标称规格算 4.0 已够 380/台(#430 的 6.0 → 4.0 是收紧,
+  # 6.0 的 570 槽是虚容量,内存只够 383),真实上限一直由内存决定。
+  cpu_overcommit_ratio: 6.0
+  # ⚠ 2.0 的内存记账在 #352 实测过 150%(374 个 1c2G 塞进 384GB)、`free -g` 剩 0G;
+  # 保守值 1.0。物理层防护由 scheduling.mem_safety_floor_ratio 用 host 自报的实测
+  # MemAvailable 兜底(两维职责分离:账本防超卖,实测防 OOM),不靠记账超卖赌 balloon。
+  mem_overcommit_ratio: 2.0
   #
   # 当前【留空】:四机型统一 cpu=4.0 / mem=1.0 就能达到按标称规格定义的容量目标,
   # 不需要任何补偿系数。原因是 host 现在按【标称】规格注册容量(init-host.sh 查
@@ -149,6 +150,8 @@ scheduling:
   # 四级机型亲和排序开关。false = 逐字节回落既有的 free_vcpu / min(两维ratio) 排序
   # (回退开关:关掉即恢复现状,不需回滚代码)。
   affinity_enabled: true
+  spread_max_hosts_per_batch: 3      # 每批最多铺到 3 台 host,控制 SendCommand 扇出
+  host_selection_score_floor: 0.39   # 生产基线(代码缺省 0.25):抬高低分 host 权重,避免冷恢复过度集中
   # 机型优先顺序(family 前缀)。业务要求:R 系优先填满、M 系少接留安全余量。
   # 排序键是两级 —— 主键 mem_per_vcpu 分档(R 系 8.0 GB/vCPU vs M 系 4.0),次键本表
   # 定同档内代际。为什么需要次键:4 机型的 GB/vCPU 只有 2 个不同值(r8g=r7g=8.0、
@@ -385,13 +388,12 @@ scaler:
   # 控制面重构阶段1 — lifecycle SQS 队列(削峰)。true=建 openclaw-lifecycle 队列
   # +DLQ+consumer Lambda,create/start/stop/delete 入队由 consumer 受控并发消费
   # (治同步直驱 SSM 在持续高并发下的雪崩,见 develop-dev/DESIGN-控制面重构)。
-  # 默认 false=走原同步路径(向后兼容,小规模/demo 够用)。
-  # ⚠ 大规模建租户必开,触发阈值远低于"千级":实测(2026-06-30)同步路径下
+  # 示例按生产基线开启(代码缺省 false=同步路径)。同步路径的触发阈值远低于"千级":实测(2026-06-30)
   # **仅 40 并发 POST /tenants 就有 11 个永久卡 creating**,根因是每租户一条
   # ssm.send_command 打同一 metal,超 SSM 单实例并发配额 → TimedOut → launch-vm 没跑。
   # 所以一次性建满 380/台(扩容、重建、压测)这类场景必须开本队列削峰,不是只有
   # 上线峰值才开(见 380 租户 SSM 并发压测结论)。
-  lifecycle_queue_enabled: false
+  lifecycle_queue_enabled: true
   # Phase 2 — 把 POST /tenants 建租户也走 FIFO 队列(默认 false=同步直驱,向后兼容)。
   # 开了之后:建租户做完廉价校验即入队返 202,consumer 按 lifecycle_consumer_concurrency
   # 限速逐个发 launch-vm 的 SSM,瞬时 380 建租户不再同步打爆 SSM 单实例并发墙。FIFO 的
@@ -399,55 +401,47 @@ scaler:
   # 需 lifecycle_queue_enabled=true(共用同一 FIFO 队列)。建租户端到端时延经 CloudWatch
   # OpenClaw/ControlPlane TenantCreateLatencySeconds 指标实测(1 分钟 SLA 守护)。
   create_via_queue: false
-  # consumer 并发上限=限流阀,设到「SSM 单实例可承受的并发」而非越大越好。实测
-  # 40 并发就触发 SSM TimedOut,故单 metal 场景应设到约 5-10(实测 SSM 单实例承受区间),
-  # 不是 50;多 host 可按 host 数线性放大。瞬时千级入队、consumer 按此速率平稳消费。
-  lifecycle_consumer_concurrency: 50
+  # consumer 保留并发(限流阀)。生产基线 75(2026-08-31 起),与下面的 ESM 上限相等。
+  # 历史口径:实测 40 并发就触发 SSM TimedOut,故 host 侧仍是 agent 内置 5 worker 的环境
+  # 应设到约 5-10 —— 那个区间是被 host 侧 5 个 worker 倒推出来的,而 host 侧那个数是可调的。
+  lifecycle_consumer_concurrency: 75
   # ── #565 G5:控制面并发与 host 侧 SSM worker 上限**必须成对**改 ─────────────────
-  # 上面那句「单 metal 应设 5-10」写在 host 侧 worker 上限还是 agent 内置默认 **5** 的
-  # 时代 —— 它没错,但**不完整**:那个 5-10 是被 host 侧的 5 个 worker 倒推出来的,
-  # 而 host 侧那个数**是可以调的**。所以真正的规则不是"控制面并发要小",而是**两侧成对**。
-  #
   # 两个数:
   #   · 本文件的 `lifecycle_max_concurrency` → ESM `ScalingConfig.MaximumConcurrency`,
-  #     最多几个 consumer 同时在飞。不填 = `deploy/stacks/lambdas.py` 里的代码默认。
+  #     最多几个 consumer 同时在飞。不填 = `deploy/stacks/lambdas.py` 里的代码默认(10)。
   #   · `deploy/userdata/init-host.sh` 的 `Mds.CommandWorkersLimit`(现为 **20**,
   #     buffer 10)→ 写进 host 的 `/etc/amazon/ssm/amazon-ssm-agent.json`,
   #     单台 host 同时能跑几条 SSM 命令。
   #
-  # **只提一侧都是白费,而且失败方式不同**:只提本文件这个 → 请求被送出来但堆在 agent 的
-  # worker 前面排队,而排队时间算在客户死线里(#565 的三段预算),于是表现成「到点判失败」
-  # 而不是「变慢」;只提 agent 那个 → ESM 压根不会送那么多进来。
-  # 这条耦合两头都有闸,**你在本文件里配的值也逃不掉**:
-  #   · `tests/test_565_g5_agent_worker_parity.py` 钉住代码默认值 ≤ `CommandWorkersLimit`,
-  #     并钉住 `lambdas.py::_HOST_SSM_COMMAND_WORKERS` 与那个 shell 里的数逐字相等;
-  #   · `lambdas.py` 在 **synth 期** fail-loud:本文件配的值一旦超过 host worker 上限就
-  #     `raise`,部署压根起不来。
-  # 先前只有前一条,于是在这里写 30 既不红也不拦(Codex 独立复审 2026-08-25 指出)——
-  # 部署会静默成功,然后表现成「到点判失败」,而日志上看不出是排队造成的。
+  # **只提一侧的失败方式不同**:只提本文件这个 → 请求被送出来但堆在 agent 的 worker 前面
+  # 排队,而排队时间算在客户死线里(#565 的三段预算),于是表现成「到点判失败」而不是
+  # 「变慢」;只提 agent 那个 → ESM 压根不会送那么多进来。
+  # 两头的闸:
+  #   · `tests/test_565_g5_agent_worker_parity.py` 钉住 `lambdas.py::_HOST_SSM_COMMAND_WORKERS`
+  #     与那个 shell 里的数逐字相等;
+  #   · `lambdas.py` 在 **synth 期**比较本文件的值与 host worker 上限,超过时打 WARNING
+  #     (此前是 raise;生产基线自 2026-08-31 起按运维决策以 75 对 20 运行,超出部分排在
+  #     agent 前面并计入死线,所以改为告警不阻断)。
   #
   # host 侧 20/10 是真机实测的(us-west-2,2026-08-25,每档有 agent 重启时间戳):
   # 默认 5 下发 12 条命令严格分 3 批每批 5;`20/10` 下发 24 条得 20 同时 + 4 排队;
   # `50/25` 得 50 同时 + 10 排队 —— 线性生效,buffer 取 worker 的一半即够。
   #
-  # **第三道墙在这两个之上,别越过**:SSM `SendCommand` 的服务端限流实测约 **6.6 rps**
-  # 502 占 89.5%。它**不能自助提额**(160 个服务配额里没有它的 TPS 项)。提并发到某个点
-  # 之后就会撞它,那时失败只是从「agent 排队」换成「控制面被限流」,没有变好。
+  # **第三道墙在这两个之上**:SSM `SendCommand` 的服务端限流(实测约 **6.6 rps** 时
+  # 502 占 89.5%)。它没有自助配额项,提额要经 AWS Support。提并发到某个点之后就会撞它,
+  # 那时失败只是从「agent 排队」换成「控制面被限流」。
   #
   # 还有一条 AWS 硬约束:`lifecycle_max_concurrency ≤ lifecycle_consumer_concurrency`
-  # (且前者硬范围 2..1000),`lambdas.py` 里有两个 `raise ValueError` 在 synth 期挡住,
-  # 所以**要提就三个数一起看**。留注释态:出厂默认不动,因为 20 对 host 侧仍是 5 worker
-  # 的环境是错的 —— 那种环境该先滚一批带新 `init-host.sh` 的 host。
-  # lifecycle_max_concurrency: 20
+  # (且前者硬范围 2..1000),`lambdas.py` 里这两条仍在 synth 期 `raise ValueError`。
+  lifecycle_max_concurrency: 75
   # per-user 舰队反查索引 gsi_tenant_user(按 tenant_user_id 分区,供
   # GET/POST /users/{tenant_user_id}/* 反查该用户名下所有节点,见 stack.py:121 读取点、
   # handler.py:128 GSI_TENANT_USER 常量、handler.py:3800 反查 Query)。
-  # 默认 false=不建该 GSI(/users/* 端点降级,核心租户 CRUD 不受影响)。
-  # ⚠ DynamoDB 限制「一次 update 只能加 1 个 GSI」:首次部署若 gsi_owner 尚未 ACTIVE,
-  # 本开关须保持 false 让 gsi_owner 先建好,待其 ACTIVE 后再设 true 单独触发一次
-  # cdk deploy 加 gsi_tenant_user(分两步,见 stack.py:116-123)。
+  # 示例按生产基线建该 GSI(/users/* 端点依赖它;代码缺省 false=不建)。
+  # ⚠ DynamoDB 限制「一次 update 只能加 1 个 GSI」:已有表若 gsi_owner 尚未 ACTIVE,
+  # 须按 rollout 脚本提示临时分阶段设置,待其 ACTIVE 后再单独加 gsi_tenant_user。
   # 键名必须是 add_gsi_tenant_user(改名前的旧键名已废,stack 不读)。
-  add_gsi_tenant_user: false
+  add_gsi_tenant_user: true
   # Scale query indexes are cumulative rollout gates. Enable and deploy exactly
   # one new gate at a time because DynamoDB permits one GSI create per update.
   # 这四个键描述的是「这张表上应当存在什么查询 GSI」的期望态,不是「本次 deploy
@@ -460,18 +454,18 @@ scaler:
   # Before every deploy run:
   # uv run --with boto3 --with pyyaml python
   #   scripts/checks/tenant-query-rollout.py --region <region>
-  add_gsi_tenant_host: false
-  add_gsi_tenant_status: false
+  add_gsi_tenant_host: true
+  add_gsi_tenant_status: true
   # #627 —— add_gsi_tenant_rootfs 改成 true 时,必须同时把下面的
   # tenant_query.rootfs_backfill_complete 设成 true(前提是 backfill 真的做完了),
   # 否则预检换成另一条报错继续 fail-closed。预检报错本身会点出这五个键。
-  add_gsi_tenant_rootfs: false
+  add_gsi_tenant_rootfs: true
 
 tenant_query:
-  # Enable only after all four tenant query GSIs report ACTIVE.
-  enabled: false
-  # Set only after scripts/tenant-rootfs-query-backfill.py --dry-run and apply complete.
-  rootfs_backfill_complete: false
+  # 示例按生产基线开启(代码缺省 false);须四个 GSI 全 ACTIVE,已有表逐个加并先跑 tenant-query-rollout.py。
+  enabled: true
+  # 已有表启用 rootfs GSI 前仍须完成 backfill。
+  rootfs_backfill_complete: true
 
 tenant_stats:
   # Explicit scan-cost gate. false creates no writer or minute schedule.
@@ -486,7 +480,7 @@ tenant_stats:
 # engineering/00-knowledge-base/decisions/ADR-controlplane-sqs-batch-dispatch.md。
 #
 # 开关矩阵(interfaces.md L30):
-#   dispatch.enabled=false → 什么都不建,现状不变(向后兼容)。
+#   dispatch.enabled=false → 什么都不建,现状不变(向后兼容;代码缺省)。
 #   dispatch.enabled=true  → create/start 一律走 dispatch,scaler.create_via_queue 被忽略。
 #   两者同 true             → stack.py synth 直接 raise ValueError(fail-loud,防双入队)。
 # 迁移三步:
@@ -501,13 +495,13 @@ tenant_stats:
 #   aws ssm put-parameter --overwrite --name /openclaw/dispatch/config --value 'andon=stop'
 # 消费端每次 SendCommand/BatchWriteItem 前 GetParameter 单读(读失败 fail-closed)。
 dispatch:
-  enabled: false      # 默认关,零新资源
+  enabled: true       # 生产基线;代码缺省 false(不填不建任何 dispatch 资源)
   # push=聚合 SSM+ParamStore 分片(回退,受 ~3 TPS PutParameter + 24KB 参数区限);
-  #     PutParameter 退出热路径);pull=host-agent 5s 轮询自取(二期,无 SSM 叫醒)。
-  mode: push          # 一期部署显式设 ddb;默认 push 保持存量部署零变化
-  esm_max_concurrency: 10   # SQS Lambda ESM ScalingConfig MaximumConcurrency(硬 range 2..1000)
+  # ddb=assignments 表承载,PutParameter 退出热路径;pull=host-agent 轮询自取。
+  mode: ddb           # 生产基线;代码缺省仍是 push(不填会回到 push)
+  esm_max_concurrency: 25   # 生产基线(代码缺省 10);SQS Lambda ESM ScalingConfig MaximumConcurrency,硬 range 2..1000
   batching_window_seconds: 2   # 攒批降 Lambda 冷启开销;0..300
-  max_batch_size: 500   # 单次 invoke 里的最大装箱租户数;1..10000(推导 executionTimeout 也受制于此)
+  max_batch_size: 30    # 等于单 host launch 并发,一批一轮(代码缺省 500;1..10000,推导 executionTimeout 也受制于此)
   dlq_max_receive_count: 3   # DLQ maxReceiveCount;一进 DLQ 就告警(alarm openclaw-dispatch-dlq-not-empty)
 
 # ========== 生命周期操作死线(#564 G5,客户压测第 1 项)==========
@@ -545,11 +539,14 @@ dispatch:
 lifecycle:
   deadline_sec:
     create: 180     # #562 已落地;本轮把它从 Python 常量迁到 env(客户要求"每个"都能改)
-    suspend: 180
-    restore: 180
-    restart: 180    # 客户 2026-08-21 追加
-    start: 180      # #604 后续项;与 restart 同档
-    rebuild: 180    # 客户 2026-08-21 追加
+    # 五档 235 = 2026-08-29 起的生产基线(运维经 SSM 抬上去的值)。这一段是权威:CDK 把它
+    # 同时注入 env 与 SSM 参数;要改就改这里再 deploy,或改 SSM 立即生效。**不要删掉这五行**:
+    # 不写会回到 Lambda 代码里的表(180,与生产 Lambda 逐字节一致,故意不动),deploy 会把 SSM 冲回 180。
+    suspend: 235
+    restore: 235
+    restart: 235
+    start: 235
+    rebuild: 235
     backup: 600     # **网关手动备份**;系统定时备份有自己的错峰语义,不受此约束
     delete: 600     # 只约束「给上层的答复」;实际删除不得丢弃,必须继续重试到成功
 
@@ -778,10 +775,10 @@ cloudfront:
 # 额外允许访问 tenant control UI 的 Origin 列表；本部署自己的 dashboard/console URL
 # 会自动加入,不需要在这里重复。最终值发布到 /openclaw/control-ui-allowed-origins,
 # 并在每个 tenant 的每次启动时成为完整 allowed set(whole-array replacement,不是 append)。
-# 在这里放 `*` 会 fleet-wide 关闭 Origin checking。
-# control_ui:
-#   extra_allowed_origins:
-#     - "https://operator.invalid"
+# 在这里放 `*` 会 fleet-wide 关闭 Origin checking;生产基线即 `*`。
+control_ui:
+  extra_allowed_origins:
+    - "*"
 
 # ========== Lifecycle Notifications (可选, SNS) ==========
 # 启用后, API Lambda 在 tenant 创建/删除/启停等事件时 publish 到 SNS topic

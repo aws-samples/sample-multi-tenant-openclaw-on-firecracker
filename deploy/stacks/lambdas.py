@@ -47,7 +47,8 @@ import core.create_deadline as _create_deadline  # noqa: E402
 # 「代码默认值 ≤ worker 上限」,而部署真正用的是 `config.yml` 里的值 —— 在那里写 30 既不会
 # 让测试红也不会让 synth 红,于是 ESM 会送 30 个并发进 20 个 worker 的 host,请求堆在 agent
 # 前面排队,**而排队时间算在客户死线里**(表现成「到点判失败」而不是「变慢」)。
-# 下面那条 `_lc_max_conc > _HOST_SSM_COMMAND_WORKERS` 的 fail-loud 把这条路也堵上。
+# 下面那条 `_lc_max_conc > _HOST_SSM_COMMAND_WORKERS` 的检查把这条路点出来。2026-08-31 起
+# 生产按运维决策以 75 对 20 运行,所以 synth 期从 raise 改为 WARNING(排队仍计入死线)。
 _HOST_SSM_COMMAND_WORKERS = 20
 
 
@@ -1235,15 +1236,17 @@ def build_lambdas(self, ctx):
                 ">= max_concurrency (AWS hard constraint) or the ESM can't scale to it."
             )
         # #565 G5 —— 与 host 侧 SSM worker 上限成对。超了不会报错、只会**静默变慢再到点判死**
-        # (多出来的并发堆在 agent 前面排队,而排队时间算在客户死线里),所以在 synth 期 fail-loud。
-        # 一条动作里若将来并发下发多条 SSM 命令,这个 1:1 对齐就不够了 —— 那时要按条数折算。
+        # (多出来的并发堆在 agent 前面排队,而排队时间算在客户死线里),所以在 synth 期点名。
+        # 2026-08-31 起生产按运维决策以 75 对 20 运行,这里从 raise 改为 WARNING:不阻断部署,
+        # 但把取舍打进 synth 输出。一条动作里若将来并发下发多条 SSM 命令,这个 1:1 对齐就
+        # 不够了 —— 那时要按条数折算。
         if _lc_max_conc > _HOST_SSM_COMMAND_WORKERS:
-            raise ValueError(
-                f"scaler.lifecycle_max_concurrency={_lc_max_conc} exceeds host-side SSM "
+            print(
+                f"WARNING: scaler.lifecycle_max_concurrency={_lc_max_conc} exceeds host-side SSM "
                 f"agent Mds.CommandWorkersLimit={_HOST_SSM_COMMAND_WORKERS} "
-                "(deploy/userdata/init-host.sh step1c). Raise BOTH or neither: the extra "
-                "concurrency would just queue in front of the agent, and queueing time is "
-                "charged against the customer deadline."
+                "(deploy/userdata/init-host.sh step1c). The extra concurrency queues in front "
+                "of the agent and queueing time is charged against the customer deadline.",
+                file=_sys.stderr,
             )
         _lc_esm = lifecycle_consumer.add_event_source_mapping(
             "LifecycleQueueEsm",

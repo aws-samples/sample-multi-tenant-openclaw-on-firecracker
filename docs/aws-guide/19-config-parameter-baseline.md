@@ -74,8 +74,8 @@
 | --- | --- | --- | --- | --- | --- | --- |
 | `host.instance_type` | host 机型;列表首项同时是 LT 主类型与 scaler 容量估算基准 | `r8g.metal-24xl` | 同 | `r8g.metal-24xl` | `r8g.metal-24xl` | `SPEC` r8g.metal;`AWS` 768 GiB/96 vCPU |
 | `host.instance_types` | 混池优先序;须与 `scheduling.family_order` 同序 | `[r8g.metal-24xl, r7g.metal, m8g.metal-24xl, m7g.metal]` | 无此键(单机型) | 未设(用单一机型) | 同默认 | `ADR-heterogeneous`(**Proposed**) |
-| `host.cpu_overcommit_ratio` | vCPU 超卖比 | **`4.0`** | `2.0` → `6.0` → `8.0`(`38a4f262` #215 · 07-12)→ `6.0`(`ae758f86` #198R15 · 07-14 **误翻**)→ `4.0`(`70eff85f` #430 · 08-12) | ⚠️ **`6.0`**(drift) | `4.0` | `#430`:R 系 8.0÷2.0 GB/vCPU = 4.0 恰好匹配,95×4 = 380 槽 |
-| `host.mem_overcommit_ratio` | 内存超卖比(硬限) | **`1.0`** | `1.5` → `2.0`(#215)→ `1.5`(`ae758f86` 误翻)→ `1.0`(`70eff85f` #430) | ⚠️ **`2.0`**(危险 drift) | `1.0` | `实测` #352:1:4 CPU 超卖下 m8g.metal-24xl 塞 374 VM,`free -g` 用到 376/376G **剩 0G** |
+| `host.cpu_overcommit_ratio` | vCPU 超卖比 | **`6.0`** | `2.0` → `6.0` → `8.0`(`38a4f262` #215 · 07-12)→ `6.0`(`ae758f86` #198R15 · 07-14 **误翻**)→ `4.0`(`70eff85f` #430 · 08-12) | `6.0` | `4.0` | 示例配置取生产基线 `6.0`;保守值 `4.0` —— `#430`:R 系 8.0÷2.0 GB/vCPU = 4.0 恰好匹配,95×4 = 380 槽 |
+| `host.mem_overcommit_ratio` | 内存超卖比(硬限) | **`2.0`** | `1.5` → `2.0`(#215)→ `1.5`(`ae758f86` 误翻)→ `1.0`(`70eff85f` #430) | `2.0` | `1.0` | 示例配置取生产基线 `2.0`;保守值 `1.0` —— `实测` #352:1:4 CPU 超卖下 m8g.metal-24xl 塞 374 VM,`free -g` 用到 376/376G **剩 0G** |
 | `host.overcommit_by_family` | per-family 超卖比覆盖 | `{}` | 曾配 mem 补偿系数 1.022/1.023/1.025/1.028 | 未设 | `{}` | `#430`:改按标称规格注册容量后系数全部消失,不再需要魔数 |
 | `host.reserved_vcpu` | host 自留 vCPU | `1` | 同 | `2` | `2` | 生产样例(host-agent + 系统留 2 核) |
 | `host.reserved_mem_mb` | host 自留内存 | `2048` | 同 | `2048` | `2048` | 一致,无争议 |
@@ -99,6 +99,8 @@
 | `balloon.enabled` | balloon 内存回收 | `true` | 同 | `true` | `true`(但**不可依赖**) | `ADR-heterogeneous` § 2.1 裁决:实测未接线(`amount_mib: 0`),回收未生效 |
 | `balloon.max_inflate_ratio` | 最多回收 VM 声明内存比例 | `0.4` | 同 | 未设 | `0.4` | 未接线前该值无实际效果 |
 | `scheduling.affinity_enabled` | 四级机型亲和排序 | `true` | 无此键(`70eff85f` #430 新增) | 未设 | `true` | `ADR-heterogeneous`(**Proposed**);false 回落 free_vcpu 排序 |
+| `scheduling.spread_max_hosts_per_batch` | 单批最多铺开的 host 数 | `3` | `6`(#661)→ `3`(#689;example 此前无此键) | `3` | `3` | 每台 host 一条 SendCommand;限制扇出并保持单批可控 |
+| `scheduling.host_selection_score_floor` | 加权随机分数下限 | `0.39` | `0.25` | `0.39` | `0.39` | 示例配置 `0.39`,代码缺省仍 `0.25`;0.25 在 2026-08-31 压测中让冷恢复集中到少数 host,0.39 让落点更扁平 |
 | `scheduling.family_order` | 机型优先序 | `["r8g","r7g","m8g","m7g"]` | 无此键(#430 新增) | 未设 | 同默认 | R 系先填满、M 系留安全余量;须与 `host.instance_types` 同序 |
 | `scheduling.mem_safety_floor_ratio` | 物理内存安全水位;实测 MemAvailable 低于此比例不接新租户 | `0.10` | 无此键(`70eff85f` #430 新增) | 未设 | `0.10` | `ADR-heterogeneous` 验收口径:满载压测每台剩余内存 ≥ 物理 10%、OOM 恒为 0 |
 | `scheduling.mem_check_ttl_sec` | 物理内存信号新鲜度 TTL | `300` | 无此键(#430 新增) | 未设 | `300` | 超期 fail-open,不用过期读数封锁 host |
@@ -144,26 +146,28 @@
 | `asg.max_capacity` | host ASG 最大台数 | ⚠️ `8` | 同 | ⚠️ `100` | **`320`** | `推算` `SPEC` 300 + 约 7% 滚动/故障冗余;默认 8 与生产 100 都装不下 10 万(见 § 19.1 ②) |
 | `asg.lifecycle_hook_timeout` | init-host 必须在此超时内完成 | `3600` | `600` → `1200` → `3600`(`c063e9b2` #488 · 08-13) | `3600` | `3600` | `实测` imported VPC + metal 场景 1200s 也不够;`preflight-region.sh` 门是 ≥2700 |
 | `asg.use_spot` | Spot 实例 | `false` | 同 | 未设 | `false` | metal + 有状态租户,Spot 中断代价高 |
-| `scaler.lifecycle_queue_enabled` | lifecycle FIFO 队列削峰(stop/delete 有序) | `false` | 同 | `true` | `true` | `实测` 同步路径下仅 40 并发 POST /tenants 就有 11 个永久卡 creating |
+| `scaler.lifecycle_queue_enabled` | lifecycle FIFO 队列削峰(stop/delete 有序) | `true` | `false` | `true` | `true` | 示例配置 `true`,代码缺省仍 `false`;`实测` 同步路径下仅 40 并发 POST /tenants 就有 11 个永久卡 creating |
 | `scaler.create_via_queue` | 建租户走 FIFO | `false` | 同 | `false` | `false` | 与 `dispatch.enabled=true` **互斥**(同 true 则 synth raise) |
-| `scaler.lifecycle_consumer_concurrency` | consumer 并发上限(限流阀) | ⚠️ `50` | `10`(#215)→ `50`(`ae758f86` · 07-14) | `50` | **`10`** | `实测` `ADR-sqs-dispatch` § 2.1:consumer 10 并发直发 SSM 即撞 ThrottlingException;40 并发 11 TimedOut。根因 `AWS` SSM Agent 单实例 `DefaultCommandWorkersLimit=5` + buffer 5(源码 `constants.go:31-35`)。**默认 50 与自身注释("应设 5-10,不是 50")矛盾** |
+| `scaler.lifecycle_consumer_concurrency` | consumer 保留并发 | `75` | `10`(#215)→ `50`(`ae758f86` · 07-14) | `75` | `75` | 示例配置 `75`(代码缺省 `50`),2026-08-31 起的生产基线;与 ESM MaximumConcurrency 相等 |
+| `scaler.lifecycle_max_concurrency` | lifecycle ESM MaximumConcurrency | `75` | `10` | `75` | `75` | 示例配置 `75`(代码缺省 `10`);host worker 仍为 20,超出部分在 agent 前排队并计入死线,synth 只告警 |
 | `scaler.interval_minutes` | scaler 巡检间隔 | `3` | 同 | 未设 | `3` | 无争议 |
 | `scaler.idle_timeout_minutes` | 空闲判定 | `10` | 同 | 未设 | `10` | 自动缩容当前在代码里硬关(`IDLE_RECLAIM_ENABLED=False`),该值当前无回收效果 |
-| `dispatch.enabled` | SQS 标准队列 + 装箱消费 | `false` | 无此键(`f77ecf4e` · 07-05 新增) | `true` | `true` | 10 万规模建租户必走装箱;`ADR-sqs-dispatch` 目标每分钟 6000 租户(100/s) |
-| `dispatch.mode` | manifest 载体 | `push` | 无此键 → `push`;`ddb` 载体 `f7250c95` · 07-06 加入 | `ddb` | **`ddb`** | `AWS` PutParameter 默认 3 TPS / higher throughput 10 TPS 是硬瓶颈;`ddb` 让 PutParameter 退出热路径 |
-| `dispatch.esm_max_concurrency` | SQS Lambda ESM MaximumConcurrency | `10` | 无此键(`f77ecf4e` 新增即 10) | 未设 | `20` | `ADR-sqs-dispatch` § Q5 明确"设 10-20"(**Proposed**);约 300 host 规模取上界。`AWS` 硬 range 2–1000 |
+| `dispatch.enabled` | SQS 标准队列 + 装箱消费 | `true` | 无此键(`f77ecf4e` · 07-05 新增) | `true` | `true` | 示例配置 `true`,代码缺省仍 `false`;10 万规模建租户必走装箱;`ADR-sqs-dispatch` 目标每分钟 6000 租户(100/s) |
+| `dispatch.mode` | manifest 载体 | `ddb` | 无此键 → `push`;`ddb` 载体 `f7250c95` · 07-06 加入 | `ddb` | **`ddb`** | 示例配置给 `ddb`(生产 `openclaw-api` / `openclaw-lifecycle-consumer` 的 `DISPATCH_MODE` 实测即 `ddb`),让 PutParameter 退出热路径;代码缺省仍 `push`,不填会回退 |
+| `dispatch.esm_max_concurrency` | SQS Lambda ESM MaximumConcurrency | `25` | 无此键(`f77ecf4e` 新增即 10) | `25` | `25` | 生产基线(代码缺省 `10`);`AWS` 硬 range 2–1000 |
 | `dispatch.batching_window_seconds` | 攒批窗口 | `2` | 无此键(`f77ecf4e`) | 未设 | `2` | `AWS` 标准队列支持 window ≤300s(FIFO 不支持);2s 窗口在 100/s 下攒 200 条 |
-| `dispatch.max_batch_size` | 单次 invoke 装箱租户数 | `500` | 无此键(`f77ecf4e`) | 未设 | `500` | `AWS` 标准队列 batch ≤10,000;`ddb` 载体不受 ParamStore 4 KB 限(`push` 载体须切到 100–200/host) |
+| `dispatch.max_batch_size` | 单次 invoke 装箱租户数 | `30` | 无此键(`f77ecf4e`) | `30` | `30` | 等于 `DISPATCH_HOST_LAUNCH_CONCURRENCY`,一批一轮(代码缺省 `500`) |
 | `dispatch.dlq_max_receive_count` | DLQ maxReceiveCount | `3` | 无此键 | 未设 | `3` | 一进 DLQ 即告警 `openclaw-dispatch-dlq-not-empty` |
+| `lifecycle.deadline_sec.{suspend,restore,restart,start,rebuild}` | 五档生命周期总死线 | `235` | `180` | SSM `235`(env/代码表 `180`) | `235` | 2026-08-29 生产用 SSM 把五档抬到 `235`;示例配置显式写 `235`,CDK 同时注入 env 与 SSM。Lambda 代码里的表仍是 `180`(与生产 Lambda 逐字节一致);config 不写这五个键会按代码表把 SSM 重置回 `180`,所以不要删 |
 | — | SSM managed nodes 配额 | 非 config 键 | — | — | 约 300 台 < `2400`/region | `AWS` 默认 managed nodes 2400/region,约 300 台有 8 倍余量 |
 
 ## 19.7 控制面 · 查询、健康与数据保护
 
 | 参数 | 意义 | 当前默认 | 曾经默认(commit) | 生产实际 | 10 万推荐值 | 推荐依据 |
 | --- | --- | --- | --- | --- | --- | --- |
-| `scaler.add_gsi_tenant_user` 等 4 个 GSI 门 | 规模化查询索引 | 全 `false` | 同 | `false` | **全 `true`(逐个部署)** | 10 万租户下无 GSI = 全表扫;`AWS` DynamoDB **一次 update 只能加 1 个 GSI**,必须一次开一个、等 ACTIVE 再开下一个 |
-| `tenant_query.enabled` | 规模化查询总开关 | `false` | 无此键(`adbb68c9` #388 · 07-27 新增) | `false` | `true`(**四个 GSI 全 ACTIVE 后**) | 顺序门:提前开会查不到索引 |
-| `tenant_query.rootfs_backfill_complete` | rootfs 回填完成标记 | `false` | 无此键(#388) | `false` | `true`(回填脚本 apply 完成后) | 须先跑 `scripts/tenant-rootfs-query-backfill.py`(dry-run) |
+| `scaler.add_gsi_tenant_user` 等 4 个 GSI 门 | 规模化查询索引 | 全 `true` | 全 `false` | 全 `true` | 全 `true` | 示例全 `true`(代码缺省全 `false`);已有表受 DynamoDB 一次 update 只能加 1 个 GSI 限制,仍须逐个部署 |
+| `tenant_query.enabled` | 规模化查询总开关 | `true` | 无此键(`adbb68c9` #388 · 07-27 新增) | `true` | `true` | 示例 `true`(代码缺省 `false`);须四个 GSI 全 ACTIVE,已有表先跑 rollout 检查 |
+| `tenant_query.rootfs_backfill_complete` | rootfs 回填完成标记 | `true` | 无此键(#388) | `true` | `true` | 示例 `true`(代码缺省 `false`);已有表启用 rootfs GSI 前仍须完成 backfill |
 | `tenant_stats.enabled` | 统计写入器 + 分钟调度 | `false` | 无此键(#388) | `false` | `true` | 10 万规模需要容量可观测;显式 scan-cost 门,开启前算成本 |
 | `health_check.interval_minutes` | 健康检查间隔 | `5` | 同 | 未设 | `5` | 约 300 台/5 min 无压力 |
 | `health_check.max_failures` | 连续失败判死 | `3` | 同 | 未设 | `3` | 无争议 |
@@ -187,16 +191,17 @@
 
 ---
 
-## 19.8 已确认的六处矛盾与缺口
+## 19.8 已确认的风险与历史缺口
 
-按严重度排序。**这些都是仓库现状,不是假设。**
+按严重度排序。已修项保留生产取舍,其余是当前仓库风险。
 
-### ① 生产样例的超卖值是已被实测证否的危险值 · 高
+### ① 生产在跑的超卖值高于实测安全线 · 高
 
-`samples/config-sg-prod.yaml` 仍是 `cpu_overcommit_ratio: 6.0` / `mem_overcommit_ratio: 2.0`,
-而 `#430` 已把模板默认降到 `4.0` / `1.0`。`ADR-heterogeneous-memory-aware-scheduling` § 2.1 记载
-`#352` 满载实测:m8g.metal-24xl 被塞 374 VM,物理内存 `free -g` 用到 **376/376G 剩 0G**。
-照生产样例部署到含 M 系的混池会重演该 OOM。
+生产与 `samples/config-sg-prod.yaml` 都是 `cpu_overcommit_ratio: 6.0` / `mem_overcommit_ratio: 2.0`,
+`config.yml.example` 现按生产基线取同值(此前 `#430` 曾降到 `4.0` / `1.0`)。
+`ADR-heterogeneous-memory-aware-scheduling` § 2.1 记载 `#352` 满载实测:m8g.metal-24xl 被塞
+374 VM,物理内存 `free -g` 用到 **376/376G 剩 0G**。含 M 系的混池按 `2.0` 部署会重演该 OOM,
+物理层只有 `scheduling.mem_safety_floor_ratio` 兜底;要保守就回 `4.0` / `1.0`。
 
 ### ② 备份节拍在 10 万规模下覆盖率不足 1% · 高
 
@@ -210,11 +215,9 @@
 
 单批并发 348 或 2084 个备份对 host IO 与 S3 的影响**无一手数据**,不能直接填。
 
-### ③ `lifecycle_consumer_concurrency` 默认值与自身注释矛盾 · 中
+### ③ lifecycle consumer 与 host worker 的生产取舍 · 中
 
-默认 `50`;同段注释写「实测 40 并发就触发 SSM TimedOut,故单 metal 场景应设到约 5-10,**不是 50**」;
-`ADR-sqs-dispatch` § 2.1 记「consumer 10 并发直发 SSM 撞 ThrottlingException」。
-根因是 `AWS` SSM Agent 单实例 `DefaultCommandWorkersLimit=5` + buffer 5(源码 `constants.go:31-35`)。
+示例配置改为 `75`(代码缺省仍 `10`)。与 host 侧 `Mds.CommandWorkersLimit=20` 成对的规则仍在,超出时 synth 只告警。超出部分排在 agent 前面并计入死线。
 
 ### ④ 默认值曾被无关 MR 静默翻回旧值 · 中
 
@@ -240,13 +243,13 @@
 
 ## 19.9 10 万租户配置骨架
 
-只列**必须偏离模板默认**的键。其余保持默认。
+列出 10 万规模需要显式确认的关键键;与模板默认相同的生产基线也保留,便于审阅。
 
 ```yaml
 host:
   instance_type: r8g.metal-24xl
-  cpu_overcommit_ratio: 4.0        # 不要用 sg-prod 样例的 6.0
-  mem_overcommit_ratio: 1.0        # 不要用 2.0(#352 实测剩 0G)
+  cpu_overcommit_ratio: 6.0        # 生产基线;保守值 4.0(#430)
+  mem_overcommit_ratio: 2.0        # 生产基线;保守值 1.0(#352 实测剩 0G)
   reserved_vcpu: 2
   data_volume_gb: 900
   data_volume_iops: 8000
@@ -289,14 +292,15 @@ api:
 dispatch:
   enabled: true
   mode: ddb                        # PutParameter 3 TPS 是硬瓶颈
-  esm_max_concurrency: 20
+  esm_max_concurrency: 25
   batching_window_seconds: 2
-  max_batch_size: 500
+  max_batch_size: 30
 
 scaler:
   lifecycle_queue_enabled: true
   create_via_queue: false          # 与 dispatch.enabled 互斥
-  lifecycle_consumer_concurrency: 10   # 不是 50
+  lifecycle_consumer_concurrency: 75
+  lifecycle_max_concurrency: 75    # 超出 host worker 20 的部分排队并计入死线
   # 四个 GSI 一次只能开一个,等 ACTIVE 再开下一个
   add_gsi_tenant_user: true
   add_gsi_tenant_host: true
@@ -307,6 +311,15 @@ tenant_query:
   # 少了这行，deploy/stacks/tenant_query_rollout.py 会直接拒:
   # add_gsi_tenant_rootfs=true requires tenant_query.rootfs_backfill_complete=true
   rootfs_backfill_complete: true
+
+lifecycle:
+  deadline_sec:
+    suspend: 235                     # 不写会按代码表重置 SSM 回 180
+    restore: 235
+    restart: 235
+    start: 235
+    rebuild: 235
+
 tenant_stats:
   enabled: true
 
@@ -421,3 +434,32 @@ profile 只写「场景决定项 + CDK 硬必填键」,不复制本章的调优�
 | 已有环境的 EBS 性能收敛 | `engineering/runbooks/HOST-EBS-GP3-PERF-CONVERGE.md` |
 | 部署后必配项与责任划分 | [15 交付边界](15-delivery-boundary-and-responsibility.md) |
 | 场景 profile 的口径与边界 | `samples/profiles/README.md` |
+
+## 19.12 上生产前建议调整的参数(2026-09 基线:为什么这样改)
+
+下面这些值来自一套 300 台以上 host、持续 10–15 tps suspend/restore 压测后的生产运行态。`config.yml.example`
+已经按这些值给出;本节逐项说明**从什么改到什么、为什么这样更合理、什么情况下可以不改**。
+
+三条原则:
+
+1. **Lambda 代码与已部署版本逐字节一致。** 仓内 `core/create_deadline.py` 只同步了六个执行/排队预算字面量,死线表仍是 180;差异一律由配置承载,经 CDK 注入 env / SSM / ESM / GSI。
+2. **config 是权威。** `lifecycle.deadline_sec` 写了就同时进 env 与 SSM 参数;**不写会按代码表(180)重置 SSM**。所以示例里五档 235 必须保留,想改就改这里再 deploy,或直接改 SSM 立即生效。
+3. **CDK 代码缺省没动。** 不复制示例配置直接部署,得到的仍是旧缺省(队列关、dispatch 关、GSI 不建、死线 180)。
+
+| # | 参数 | 改动 | 为什么这样更合理 | 什么时候可以不改 |
+| --- | --- | --- | --- | --- |
+| 1 | `lifecycle.deadline_sec.{suspend,restore,restart,start,rebuild}` | `180` → **`235`** | 这五档都要先排队等消费槽再执行。持续 10–15 tps 时,180 s 装不下「排队 + 执行」,表现为**控制面到点判失败而 host 侧实际成功**(最难排查的形态)。235 在同样的执行预算下给排队段多留 55 s;create 仍 180(客户业务契约),backup/delete 仍 600 | 单 host 或并发个位数的 demo 环境;但保留 235 没有代价 |
+| 2 | `core/create_deadline.py` `_EXEC_STEPS`(代码,已随 PR 落地) | backup `90→60`、stop-vm `50→46`、restore launch `120→60`、rebuild backup `90→60` | 实测典型值 休眠 6 s / 唤醒 3.7 s / 备份 6.6 s,90–120 s 的执行预算吃掉 180 s 死线的一半以上,排队段只剩 40/60/24 s。缩到实测上界附近后,排队段变成 74/120/54 s。已知取舍:backup 60 等于 host 侧 TERM 宽限 60,`backup/handler.py` 会回落到 300 s 默认并打 `[#565]` 日志 —— 控制面记 60、host 实际上界 300 | 不需要配置;想改回去就改代码并重跑三段恒等式断言 |
+| 3 | `scaler.lifecycle_queue_enabled` / `lifecycle_consumer_concurrency` / `lifecycle_max_concurrency` | `false→true` / `50→75` / 不写(10)→**`75`** | 同步直驱路径 40 并发就有 11 个永久卡 creating,大规模必须走 FIFO 队列。有队列后 consumer 并发决定吞吐:10–15 tps 持续 suspend/restore 要 ≥75 才能在死线内消费完(20 → 50 → 75 是逐步压出来的)。前提是 host 侧 SSM agent `Mds.CommandWorkersLimit` 已提到 20(`init-host.sh` step1c)。75 对 20 多出的并发会在 agent 前排队并计入死线,这是**接受的取舍**,synth 只告警 | 不想承担排队就把两者一起设 20;单 host 环境设 5–10 |
+| 4 | `dispatch.enabled` / `mode` / `esm_max_concurrency` / `max_batch_size` | `false→true` / `push→ddb` / `10→25` / `500→30` | 批量建租户必须走装箱队列。`push` 载体受 PutParameter 约 3 TPS 与 24 KB 参数区限制,`ddb` 让 PutParameter 退出热路径。ESM 25 是建租户吞吐不够时逐步提上去的值。batch 30 等于单 host launch 并发(`DISPATCH_HOST_LAUNCH_CONCURRENCY`),一批一轮;超过 30 会让 SSM executionTimeout 跳一整轮,执行段被静默突破(见 § 19.1) | 只做单租户 demo 可以关;开了就用 `ddb`,不要回 `push` |
+| 5 | `scheduling.host_selection_score_floor` / `spread_max_hosts_per_batch` | `0.25→0.39` / 显式写 `3` | 0.25 时加权随机把冷恢复集中到少数高分 host,形成单机热点;0.39 抬高低分 host 的权重,让落点更扁平。spread 3 限制每批 SendCommand 扇出,与 SSM 速率上限配套 | host 数少于 10 台时两者影响都很小 |
+| 6 | `scaler.add_gsi_tenant_{user,host,status,rootfs}` / `tenant_query.enabled` / `rootfs_backfill_complete` | 全 `false` → 全 **`true`** | 占用与状态查询在几百台 host、万级租户下是全表 Scan,读峰值到 157k RRU/s 撞上表级默认 40k 上限(`RequestLimitExceeded` → API 500)。GSI Query 让读量回到与结果集成比例。新表一次建齐;**已有表一次只能加一个 GSI**:逐个开 `add_gsi_tenant_*`、等 ACTIVE,最后开 `tenant_query.enabled`;任一门为 `false` 时 `tenant_query.enabled` 必须同为 `false`,否则 synth 拒绝 | 千级租户以下 Scan 也够;但 GSI 建好没有运行时代价 |
+| 7 | `host.cpu_overcommit_ratio` / `mem_overcommit_ratio` | `4.0→6.0` / `1.0→2.0` | 目标 380 租户/台(1 vCPU / 2 GB)需要内存记账 2.0(384 GB 装 374 个 2 GB);这是生产在跑的值。风险:`#352` 实测物理内存剩 0 G,物理层只靠 `scheduling.mem_safety_floor_ratio` 兜底 | 含 M 系混池、或对 OOM 敏感的环境用 `4.0 / 1.0` |
+| 8 | `control_ui.extra_allowed_origins` | 注释态 → **`["*"]`** | tenant control UI 的 Origin 白名单是部署时的固定入口;前端入口变更(自有域名、多入口)会整机队被拦,生产因此关闭校验 | 入口固定就写具体域名,不要 `*` |
+
+账号级配额(不在 config 里,生产前一起提):
+
+- DynamoDB 表级读吞吐配额 `L-CF0CBE56` 默认 40,000 RRU/s;restore 突发会撞此上限,生产已提到 300,000。
+- SSM `SendCommand` 速率没有自助配额项,需要通过 AWS Support 申请。
+
+与 `lambdas.py` 的一处代码配合:`lifecycle_max_concurrency` 超过 host worker 上限时,synth 从 `raise` 改为 `WARNING`。原来的 fail-loud 让第 3 项无法部署;现在把取舍打进 synth 输出,由部署者决定是否承担排队。

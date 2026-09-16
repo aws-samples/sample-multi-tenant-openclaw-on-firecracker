@@ -61,6 +61,8 @@ class TestBalloonController:
         agent.BALLOON_MAX_ACTIONS_PER_CYCLE = 20
         agent.BALLOON_DEFLATE_BATCH = 5
         agent.BALLOON_ALLOW_BLIND_INFLATE = False
+        agent.BALLOON_MAX_ATTEMPTS_PER_CYCLE = 10
+        agent._balloon_deflate_cursor = 0
 
         agent._balloon_metrics = None
 
@@ -290,6 +292,120 @@ class TestBalloonController:
         assert agent._balloon_cycle["actions"] == 2
 
     @pytest.mark.unit
+    def test_deflate_bounds_attempts_so_the_poll_loop_cannot_stall(self, tmp_path):
+        """Walking past failures must be bounded, not unbounded.
+
+        Each failing PATCH can burn curl's --max-time, and _adjust_balloons runs
+        inline in the poll loop, so an unbounded walk over a large failing fleet
+        would stall the host heartbeat and the DDB reconcile for minutes.
+        """
+        agent.VM_DIR = str(tmp_path)
+        agent.BALLOON_DEFLATE_BATCH = 5
+        agent.BALLOON_MAX_ATTEMPTS_PER_CYCLE = 6
+        agent._balloon_deflate_cursor = 0
+        probe_results = {}
+        for index in range(30):
+            tenant_id = f"tenant-{index:02d}"
+            _make_vm(tmp_path, tenant_id)
+            probe_results[tenant_id] = {"vm_health": "up"}
+        stats = {"target_mib": 128, "actual_mib": 128}
+
+        with (
+            patch.object(agent, "_get_host_mem_info", return_value=(1000, 500)),
+            patch.object(agent, "_get_balloon_stats", return_value=stats),
+            patch.object(agent, "_set_balloon_target", return_value=False) as set_target,
+        ):
+            agent._adjust_balloons(probe_results)
+
+        assert set_target.call_count == 6, "attempts must stop at the cap"
+        assert agent._balloon_cycle["actions"] == 0
+
+    @pytest.mark.unit
+    def test_deflate_cursor_rotates_so_bounding_does_not_re_add_starvation(
+        self, tmp_path
+    ):
+        """Bounding attempts alone would let a wedged head eat the budget forever."""
+        agent.VM_DIR = str(tmp_path)
+        agent.BALLOON_DEFLATE_BATCH = 5
+        agent.BALLOON_MAX_ATTEMPTS_PER_CYCLE = 4
+        agent._balloon_deflate_cursor = 0
+        probe_results = {}
+        for index in range(12):
+            tenant_id = f"tenant-{index:02d}"
+            _make_vm(tmp_path, tenant_id)
+            probe_results[tenant_id] = {"vm_health": "up"}
+        stats = {"target_mib": 128, "actual_mib": 128}
+
+        def run_one_cycle():
+            with (
+                patch.object(agent, "_get_host_mem_info", return_value=(1000, 500)),
+                patch.object(agent, "_get_balloon_stats", return_value=stats),
+                patch.object(
+                    agent, "_set_balloon_target", return_value=False
+                ) as set_target,
+            ):
+                agent._adjust_balloons(probe_results)
+            return [c.args[0] for c in set_target.call_args_list]
+
+        first = run_one_cycle()
+        second = run_one_cycle()
+
+        assert len(first) == 4 and len(second) == 4
+        assert not set(first) & set(second), (
+            "the second cycle must reach candidates the first cycle never attempted"
+        )
+
+    @pytest.mark.unit
+    def test_deflate_discards_a_target_staged_for_an_earlier_incarnation(
+        self, tmp_path, capsys
+    ):
+        """fc.sock is a fixed path per tenant, so PID reuse must be checked.
+
+        A VM stopped and relaunched between staging the candidate and applying the
+        PATCH is reachable at the same socket; applying the staged target would
+        silently INFLATE a fresh VM that asked for nothing.
+        """
+        tenant_id = "tenant-a"
+        agent.VM_DIR = str(tmp_path)
+        _make_vm(tmp_path, tenant_id)
+        stats = {"target_mib": 512, "actual_mib": 512}
+
+        with (
+            patch.object(agent, "_get_host_mem_info", return_value=(1000, 500)),
+            patch.object(agent, "_get_balloon_stats", return_value=stats),
+            patch.object(
+                agent, "_read_proc_start_ticks", side_effect=[111, 222]
+            ),
+            patch.object(agent, "_set_balloon_target") as set_target,
+        ):
+            agent._adjust_balloons(
+                {tenant_id: {"vm_health": "up", "fc_pid": 4242}}
+            )
+
+        set_target.assert_not_called()
+        assert "VM identity changed" in capsys.readouterr().out
+
+    @pytest.mark.unit
+    def test_deflate_applies_when_identity_is_unchanged(self, tmp_path):
+        """The identity guard must not block the normal path."""
+        tenant_id = "tenant-a"
+        agent.VM_DIR = str(tmp_path)
+        sock_file = _make_vm(tmp_path, tenant_id)
+        stats = {"target_mib": 512, "actual_mib": 512}
+
+        with (
+            patch.object(agent, "_get_host_mem_info", return_value=(1000, 500)),
+            patch.object(agent, "_get_balloon_stats", return_value=stats),
+            patch.object(agent, "_read_proc_start_ticks", return_value=111),
+            patch.object(agent, "_set_balloon_target", return_value=True) as set_target,
+        ):
+            agent._adjust_balloons(
+                {tenant_id: {"vm_health": "up", "fc_pid": 4242}}
+            )
+
+        set_target.assert_called_once_with(sock_file, 448)
+
+    @pytest.mark.unit
     def test_deflate_obeys_batch_limit(self, tmp_path):
         agent.VM_DIR = str(tmp_path)
         agent.BALLOON_DEFLATE_BATCH = 2
@@ -453,7 +569,7 @@ class TestBalloonController:
         assert agent._balloon_metrics == {
             "actions": 0,
             "stats_unavailable": 0,
-            "reclaimed_mib": 128,
+            "actual_mib": 128,
         }
         # Published snapshot must be a copy, not the live accumulator, so a
         # scrape that lands mid-cycle cannot observe the post-reset zeros.
@@ -463,7 +579,7 @@ class TestBalloonController:
     def test_balloon_metrics_are_optional(self):
         without_balloon = agent._render_metrics_text({}, balloon_stats=None)
         balloon_stats = {
-            "reclaimed_mib": 256,
+            "actual_mib": 256,
             "stats_unavailable": 2,
             "actions": 1,
         }
@@ -473,6 +589,6 @@ class TestBalloonController:
         )
 
         assert "openclaw_host_balloon_" not in without_balloon
-        assert "openclaw_host_balloon_reclaimed_mib 256" in with_balloon
+        assert "openclaw_host_balloon_actual_mib 256" in with_balloon
         assert "openclaw_host_balloon_stats_unavailable 2" in with_balloon
         assert "openclaw_host_balloon_actions 1" in with_balloon

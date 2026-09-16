@@ -216,13 +216,38 @@ FAMILY_ORDER = tuple(
 
 MEM_SAFETY_FLOOR_RATIO = float(os.environ.get("MEM_SAFETY_FLOOR_RATIO", 0.0))
 
-if MEM_OVERCOMMIT_RATIO > 1.0 and MEM_SAFETY_FLOOR_RATIO <= 0.0:
+def _oversubscribed_mem_ratios() -> list:
+    """Every effective memory overcommit ratio above 1.0, global and per-family.
+
+    The global ratio alone is not the whole picture: OVERCOMMIT_BY_FAMILY can put a
+    family above 1.0 while the global value stays at 1.0, which is a supported
+    configuration. Reading only the global value would leave that case silently
+    unguarded. Per-family parsing follows the scheduler's own fallback semantics —
+    a malformed entry falls back to the global ratio rather than failing.
+    """
+    ratios = []
+    if MEM_OVERCOMMIT_RATIO > 1.0:
+        ratios.append(("global", MEM_OVERCOMMIT_RATIO))
+    for family, entry in (OVERCOMMIT_BY_FAMILY or {}).items():
+        if not isinstance(entry, dict):
+            continue
+        try:
+            mem = float(entry.get("mem", MEM_OVERCOMMIT_RATIO))
+        except (TypeError, ValueError):
+            continue
+        if mem > 1.0:
+            ratios.append((str(family), mem))
+    return ratios
+
+
+_OVERSUBSCRIBED = _oversubscribed_mem_ratios()
+if _OVERSUBSCRIBED and MEM_SAFETY_FLOOR_RATIO <= 0.0:
     print(
-        "WARN: mem_overcommit_ratio=%s with mem_safety_floor_ratio=0 — the "
-        "physical memory admission gate is OFF while memory is oversubscribed. "
-        "Balloon reclamation is best-effort; set scheduling.mem_safety_floor_ratio "
-        "(0.10 recommended) or the host can reach memory exhaustion with the "
-        "ledger still reporting free capacity." % MEM_OVERCOMMIT_RATIO
+        "WARN: memory is oversubscribed (%s) with mem_safety_floor_ratio=0 — the "
+        "physical memory admission gate is OFF. Balloon reclamation is best-effort; "
+        "set scheduling.mem_safety_floor_ratio (0.10 recommended) or the host can "
+        "reach memory exhaustion with the ledger still reporting free capacity."
+        % ", ".join("%s=%s" % (scope, ratio) for scope, ratio in _OVERSUBSCRIBED)
     )
 
 MEM_CHECK_TTL_SEC = int(os.environ.get("MEM_CHECK_TTL_SEC", 300))

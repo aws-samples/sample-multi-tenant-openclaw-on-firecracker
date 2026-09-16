@@ -2130,9 +2130,16 @@ def _get_balloon_stats(sock_file):
 
 
 def _set_balloon_target(sock_file, amount_mib):
-    """Set balloon target size (inflate/deflate)."""
+    """Set balloon target size (inflate/deflate). True only on HTTP success.
+
+    `curl -sf` already returns non-zero on a 4xx/5xx, but the result used to be
+    discarded, so a persistently failing PATCH looked exactly like a working one:
+    the caller logged the new target and counted an action. That is the same
+    silent-failure-with-green-telemetry shape this controller exists to remove,
+    so the return code is now the caller's gate.
+    """
     try:
-        subprocess.run(
+        r = subprocess.run(
             [
                 "curl",
                 "-sf",
@@ -2151,6 +2158,15 @@ def _set_balloon_target(sock_file, amount_mib):
         )
     except Exception as e:
         print(f"balloon set failed: {e}")
+        return False
+    if r.returncode != 0:
+        detail = (r.stderr or b"").decode(errors="replace").strip()
+        print(
+            f"balloon set failed: PATCH amount_mib={amount_mib} on {sock_file} "
+            f"exited {r.returncode} {detail}"
+        )
+        return False
+    return True
 
 
 def _get_host_mem_info():
@@ -2245,7 +2261,10 @@ def _inflate_balloon(tid, sock_file, vm_mem_mb, stats, host_available):
         return False
 
     target = current_balloon_mib + step
-    _set_balloon_target(sock_file, target)
+    if not _set_balloon_target(sock_file, target):
+        # Failure already logged by _set_balloon_target. Report no action so the
+        # cycle budget and the actions gauge count landed PATCHes, not attempts.
+        return False
     print(
         f"balloon inflate {tid}: {current_balloon_mib}→{target}MB "
         f"(step={step}MB reason={reason} host_avail={host_available}MB "
@@ -2272,7 +2291,8 @@ def _deflate_balloon_batch(candidates, host_available):
         return
     for tid, sock_file, current_balloon_mib in batch:
         new_target = max(0, current_balloon_mib - BALLOON_STEP_MIB)
-        _set_balloon_target(sock_file, new_target)
+        if not _set_balloon_target(sock_file, new_target):
+            continue  # failure already logged; do not count an action
         _balloon_cycle["actions"] += 1
         print(
             f"balloon deflate {tid}: {current_balloon_mib}→{new_target}MB "

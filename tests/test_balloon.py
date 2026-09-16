@@ -290,6 +290,46 @@ class TestBalloonController:
         get_host_mem_info.assert_not_called()
 
     @pytest.mark.unit
+    def test_set_target_reports_failure_on_nonzero_curl(self, capsys):
+        """A rejected PATCH must not look like a landed one."""
+        failed = MagicMock(returncode=22, stderr=b"curl: (22) HTTP 400")
+
+        with patch.object(agent.subprocess, "run", return_value=failed):
+            assert agent._set_balloon_target("/tmp/fc.sock", 128) is False
+
+        assert "balloon set failed" in capsys.readouterr().out
+
+        ok = MagicMock(returncode=0, stderr=b"")
+        with patch.object(agent.subprocess, "run", return_value=ok):
+            assert agent._set_balloon_target("/tmp/fc.sock", 128) is True
+
+    @pytest.mark.unit
+    def test_failed_patch_is_not_counted_as_an_action(self, tmp_path, capsys):
+        """`actions` must count landed PATCHes, not attempts.
+
+        Counting attempts is the same silent-failure-with-green-telemetry shape
+        the controller exists to remove.
+        """
+        tenant_id = "tenant-a"
+        agent.VM_DIR = str(tmp_path)
+        _make_vm(tmp_path, tenant_id)
+        stats = {
+            "available_memory": 1024 * 1024 * 1024,
+            "target_mib": 0,
+            "actual_mib": 0,
+        }
+
+        with (
+            patch.object(agent, "_get_host_mem_info", return_value=(1000, 100)),
+            patch.object(agent, "_get_balloon_stats", return_value=stats),
+            patch.object(agent, "_set_balloon_target", return_value=False),
+        ):
+            agent._adjust_balloons({tenant_id: {"vm_health": "up"}})
+
+        assert agent._balloon_cycle["actions"] == 0
+        assert "balloon inflate" not in capsys.readouterr().out
+
+    @pytest.mark.unit
     def test_unusable_stats_are_counted_outside_host_pressure(self, tmp_path):
         """The gauge must not depend on the branch that happens to be active.
 

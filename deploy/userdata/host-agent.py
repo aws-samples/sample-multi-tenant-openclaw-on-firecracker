@@ -2217,13 +2217,25 @@ def _balloon_vm_state(tid, info):
     return sock_file, vm_mem_mb, stats, current_balloon_mib
 
 
-def _balloon_stats_converged(tid, stats):
+def _balloon_inflate_converged(tid, stats):
+    """Gate for RAISING a target only. Deflation must never be gated on this.
+
+    Raising a target while the guest driver is still climbing toward the previous
+    one makes the driver spin in its `Out of puff! Can't get %d pages` retry loop,
+    so inflation waits. Lowering a target is the opposite: it is the relief
+    operation. With `deflate_on_oom=true` the guest kernel takes pages back out of
+    the balloon under memory pressure, which drives `actual_mib` BELOW `target_mib`
+    on its own — if that state also blocked deflation, the controller could never
+    lower the target the guest cannot reach, and the VM would stay pinned against
+    an unreachable target indefinitely. So the deflate path proceeds from
+    `actual_mib`, which converges the target down to what the guest actually holds.
+    """
     target_mib = int(stats.get("target_mib", 0) or 0)
     actual_mib = int(stats.get("actual_mib", 0) or 0)
     if abs(target_mib - actual_mib) <= BALLOON_CONVERGE_TOLERANCE_MIB:
         return True
     print(
-        f"balloon skip {tid}: target={target_mib}MiB actual={actual_mib}MiB "
+        f"balloon inflate skip {tid}: target={target_mib}MiB actual={actual_mib}MiB "
         f"not converged (tolerance={BALLOON_CONVERGE_TOLERANCE_MIB}MiB)"
     )
     return False
@@ -2277,22 +2289,31 @@ def _deflate_balloon_batch(candidates, host_available):
     remaining_budget = max(
         0, BALLOON_MAX_ACTIONS_PER_CYCLE - _balloon_cycle["actions"]
     )
-    batch = candidates[: min(BALLOON_DEFLATE_BATCH, remaining_budget)]
-    if candidates and not batch:
+    want = min(BALLOON_DEFLATE_BATCH, remaining_budget)
+    if candidates and want <= 0:
         print("balloon action budget exhausted for this cycle")
         return
-    required_mib = len(batch) * BALLOON_STEP_MIB
+    required_mib = min(want, len(candidates)) * BALLOON_STEP_MIB
     if host_available < required_mib:
         print(
             f"balloon deflate skipped: host_avail={host_available}MB cannot "
-            f"absorb batch={len(batch)} step={BALLOON_STEP_MIB}MB "
-            f"required={required_mib}MB"
+            f"absorb batch={min(want, len(candidates))} "
+            f"step={BALLOON_STEP_MIB}MB required={required_mib}MB"
         )
         return
-    for tid, sock_file, current_balloon_mib in batch:
+    # Walk the whole candidate list until `want` PATCHes have LANDED, rather than
+    # slicing a fixed prefix. A VM whose PATCH always fails (wedged API socket, or
+    # no balloon device at all because the pre-boot PUT failed) would otherwise sit
+    # at the head of a stably-ordered list and starve every tenant behind it,
+    # forever.
+    done = 0
+    for tid, sock_file, current_balloon_mib in candidates:
+        if done >= want:
+            break
         new_target = max(0, current_balloon_mib - BALLOON_STEP_MIB)
         if not _set_balloon_target(sock_file, new_target):
             continue  # failure already logged; do not count an action
+        done += 1
         _balloon_cycle["actions"] += 1
         print(
             f"balloon deflate {tid}: {current_balloon_mib}→{new_target}MB "
@@ -2337,16 +2358,23 @@ def _adjust_balloons(probe_results):
         sock_file, vm_mem_mb, stats, current_balloon_mib = state
 
         if host_pressure < 0.20:
-            if not _balloon_stats_converged(tid, stats):
+            if not _balloon_inflate_converged(tid, stats):
                 continue
             if _balloon_cycle["actions"] >= BALLOON_MAX_ACTIONS_PER_CYCLE:
                 print("balloon action budget exhausted for this cycle")
                 break
             if _inflate_balloon(tid, sock_file, vm_mem_mb, stats, host_available):
                 _balloon_cycle["actions"] += 1
-        elif host_pressure > 0.40 and current_balloon_mib > 0:
-            if _balloon_stats_converged(tid, stats):
-                deflate_candidates.append((tid, sock_file, current_balloon_mib))
+        elif host_pressure > 0.40 and (
+            current_balloon_mib > 0 or int(stats.get("target_mib", 0) or 0) > 0
+        ):
+            # No convergence gate here on purpose — see _balloon_inflate_converged.
+            # current_balloon_mib is actual_mib, so a target the guest never reached
+            # (deflate_on_oom, or an operator-set target) still gets walked down.
+            # `target_mib > 0` with `actual_mib == 0` is the worst case: the guest
+            # handed everything back but the target still says otherwise, so the
+            # driver keeps chasing it. Stepping down from actual cancels it.
+            deflate_candidates.append((tid, sock_file, current_balloon_mib))
 
     if host_pressure > 0.40:
         _deflate_balloon_batch(deflate_candidates, host_available)

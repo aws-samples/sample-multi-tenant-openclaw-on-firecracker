@@ -216,6 +216,80 @@ class TestBalloonController:
         set_target.assert_called_once_with(sock_file, 448)
 
     @pytest.mark.unit
+    def test_deflate_is_not_blocked_by_unconverged_target(self, tmp_path):
+        """`deflate_on_oom` drives actual below target; deflation must still run.
+
+        If the convergence gate applied to deflation too, a guest that handed
+        pages back under its own memory pressure could never have the target it
+        cannot reach lowered, and would stay pinned against it indefinitely while
+        the driver kept retrying.
+        """
+        tenant_id = "tenant-a"
+        agent.VM_DIR = str(tmp_path)
+        sock_file = _make_vm(tmp_path, tenant_id)
+        stats = {"target_mib": 512, "actual_mib": 192}
+
+        with (
+            patch.object(agent, "_get_host_mem_info", return_value=(1000, 500)),
+            patch.object(agent, "_get_balloon_stats", return_value=stats),
+            patch.object(agent, "_set_balloon_target", return_value=True) as set_target,
+        ):
+            agent._adjust_balloons({tenant_id: {"vm_health": "up"}})
+
+        # Steps down from actual (192), not from the unreachable target (512).
+        set_target.assert_called_once_with(sock_file, 128)
+
+    @pytest.mark.unit
+    def test_deflate_cancels_a_target_the_guest_fully_gave_back(self, tmp_path):
+        """actual_mib == 0 with target_mib > 0 is the worst case, not a no-op."""
+        tenant_id = "tenant-a"
+        agent.VM_DIR = str(tmp_path)
+        sock_file = _make_vm(tmp_path, tenant_id)
+        stats = {"target_mib": 512, "actual_mib": 0}
+
+        with (
+            patch.object(agent, "_get_host_mem_info", return_value=(1000, 500)),
+            patch.object(agent, "_get_balloon_stats", return_value=stats),
+            patch.object(agent, "_set_balloon_target", return_value=True) as set_target,
+        ):
+            agent._adjust_balloons({tenant_id: {"vm_health": "up"}})
+
+        set_target.assert_called_once_with(sock_file, 0)
+
+    @pytest.mark.unit
+    def test_deflate_does_not_starve_behind_a_persistently_failing_vm(self, tmp_path):
+        """A VM whose PATCH always fails must not block the tenants behind it.
+
+        The batch is "this many landed PATCHes", not "the first N candidates".
+        """
+        agent.VM_DIR = str(tmp_path)
+        agent.BALLOON_DEFLATE_BATCH = 2
+        probe_results = {}
+        socks = {}
+        for index in range(5):
+            tenant_id = f"tenant-{index}"
+            socks[tenant_id] = _make_vm(tmp_path, tenant_id)
+            probe_results[tenant_id] = {"vm_health": "up"}
+        stats = {"target_mib": 128, "actual_mib": 128}
+        wedged = {socks["tenant-0"], socks["tenant-1"]}
+
+        def flaky(sock_file, amount_mib):
+            return sock_file not in wedged
+
+        with (
+            patch.object(agent, "_get_host_mem_info", return_value=(1000, 500)),
+            patch.object(agent, "_get_balloon_stats", return_value=stats),
+            patch.object(agent, "_set_balloon_target", side_effect=flaky) as set_target,
+        ):
+            agent._adjust_balloons(probe_results)
+
+        landed = [
+            c.args[0] for c in set_target.call_args_list if c.args[0] not in wedged
+        ]
+        assert len(landed) == 2, "two PATCHes must land despite the wedged head"
+        assert agent._balloon_cycle["actions"] == 2
+
+    @pytest.mark.unit
     def test_deflate_obeys_batch_limit(self, tmp_path):
         agent.VM_DIR = str(tmp_path)
         agent.BALLOON_DEFLATE_BATCH = 2

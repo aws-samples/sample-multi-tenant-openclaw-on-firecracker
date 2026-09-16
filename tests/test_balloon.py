@@ -7,6 +7,7 @@ import importlib.util
 import json
 import os
 import sys
+import time
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -50,6 +51,30 @@ def _make_vm(tmp_path, tenant_id, mem_mb=4096):
 
 
 class TestBalloonController:
+    @pytest.fixture(autouse=True)
+    def _grant_lifecycle_lock(self):
+        """Hand out a real, closeable fd for the per-tenant lifecycle flock.
+
+        The controller holds `/run/lock/oc-launch-<tid>.lock` across the deflate
+        re-read/identity/PATCH sequence. `/run` is not writable in a test sandbox, and
+        the point of these tests is the decision logic, not the kernel's flock. Tests
+        that care about lock contention patch `_acquire_tenant_lock` themselves.
+        """
+        opened = []
+
+        def grant(tid, wait_sec=None, who="balloon"):
+            fd = os.open(os.devnull, os.O_RDWR)
+            opened.append(fd)
+            return fd
+
+        with patch.object(agent, "_acquire_tenant_lock", side_effect=grant):
+            yield
+        for fd in opened:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
     def setup_method(self):
         self.original_vm_dir = agent.VM_DIR
         agent.BALLOON_ENABLED = True
@@ -62,7 +87,9 @@ class TestBalloonController:
         agent.BALLOON_DEFLATE_BATCH = 5
         agent.BALLOON_ALLOW_BLIND_INFLATE = False
         agent.BALLOON_MAX_ATTEMPTS_PER_CYCLE = 10
+        agent.BALLOON_CYCLE_BUDGET_SEC = 30.0
         agent._balloon_deflate_cursor = 0
+        agent._balloon_scan_cursor = 0
 
         agent._balloon_metrics = None
 
@@ -404,6 +431,79 @@ class TestBalloonController:
             )
 
         set_target.assert_called_once_with(sock_file, 448)
+
+    @pytest.mark.unit
+    def test_deflate_never_raises_a_target_that_is_already_zero(self, tmp_path):
+        """target_mib=0 with the guest still draining must not be pushed back up.
+
+        actual_mib > step while target is already 0 means a full deflate is in
+        flight. Computing `actual - step` yields a positive number, so without the
+        guard the PATCH would raise the target from 0 and reverse the drain.
+        """
+        tenant_id = "tenant-a"
+        agent.VM_DIR = str(tmp_path)
+        _make_vm(tmp_path, tenant_id)
+        stats = {"target_mib": 0, "actual_mib": 256}
+
+        with (
+            patch.object(agent, "_get_host_mem_info", return_value=(1000, 500)),
+            patch.object(agent, "_get_balloon_stats", return_value=stats),
+            patch.object(agent, "_set_balloon_target", return_value=True) as set_target,
+        ):
+            agent._adjust_balloons({tenant_id: {"vm_health": "up"}})
+
+        set_target.assert_not_called()
+
+    @pytest.mark.unit
+    def test_deflate_skips_a_tenant_whose_lifecycle_lock_is_held(self, tmp_path):
+        """A tenant mid launch/stop/delete/migrate must be left alone this cycle."""
+        tenant_id = "tenant-a"
+        agent.VM_DIR = str(tmp_path)
+        _make_vm(tmp_path, tenant_id)
+        stats = {"target_mib": 512, "actual_mib": 512}
+
+        with (
+            patch.object(agent, "_get_host_mem_info", return_value=(1000, 500)),
+            patch.object(agent, "_get_balloon_stats", return_value=stats),
+            patch.object(agent, "_acquire_tenant_lock", return_value=None),
+            patch.object(agent, "_set_balloon_target", return_value=True) as set_target,
+        ):
+            agent._adjust_balloons({tenant_id: {"vm_health": "up"}})
+
+        set_target.assert_not_called()
+
+    @pytest.mark.unit
+    def test_cycle_time_budget_bounds_the_statistics_scan(self, tmp_path, capsys):
+        """Every VM costs a statistics GET; the pass must be time-bounded.
+
+        The attempt cap only bounds PATCHes. A fleet of slow sockets would otherwise
+        hold the poll loop — and therefore the heartbeat — for minutes.
+        """
+        agent.VM_DIR = str(tmp_path)
+        agent.BALLOON_CYCLE_BUDGET_SEC = 0.05
+        probe_results = {}
+        for index in range(40):
+            tenant_id = f"tenant-{index:02d}"
+            _make_vm(tmp_path, tenant_id)
+            probe_results[tenant_id] = {"vm_health": "up"}
+        stats = {"target_mib": 128, "actual_mib": 128}
+
+        def slow_stats(sock_file):
+            time.sleep(0.01)
+            return stats
+
+        with (
+            patch.object(agent, "_get_host_mem_info", return_value=(1000, 500)),
+            patch.object(agent, "_get_balloon_stats", side_effect=slow_stats),
+            patch.object(agent, "_set_balloon_target", return_value=True),
+        ):
+            agent._adjust_balloons(probe_results)
+
+        out = capsys.readouterr().out
+        assert "cycle time budget" in out
+        assert agent._balloon_scan_cursor not in (0,), (
+            "the scan cursor must advance so the untouched tail is reached next cycle"
+        )
 
     @pytest.mark.unit
     def test_deflate_obeys_batch_limit(self, tmp_path):

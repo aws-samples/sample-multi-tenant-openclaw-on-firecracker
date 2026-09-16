@@ -403,6 +403,13 @@ BALLOON_DEFLATE_BATCH = int(os.environ.get("BALLOON_DEFLATE_BATCH", "5"))
 BALLOON_MAX_ATTEMPTS_PER_CYCLE = int(
     os.environ.get("BALLOON_MAX_ATTEMPTS_PER_CYCLE", "10")
 )
+# Wall-clock ceiling for one whole _adjust_balloons pass. The attempt cap bounds
+# PATCHes, but every VM also costs a statistics GET, and each of those can burn
+# curl's --max-time on a slow or hung socket; on a large fleet that alone could hold
+# the poll loop for minutes ahead of the heartbeat and the DDB reconcile. Under the
+# 5s poll interval so a slow pass cannot pile up. The scan start rotates, so a
+# truncated pass still covers the rest of the fleet on the next cycles.
+BALLOON_CYCLE_BUDGET_SEC = float(os.environ.get("BALLOON_CYCLE_BUDGET_SEC", "3.0"))
 BALLOON_ALLOW_BLIND_INFLATE = (
     os.environ.get("BALLOON_ALLOW_BLIND_INFLATE", "false").lower() == "true"
 )
@@ -424,6 +431,10 @@ _balloon_cycle = {"actions": 0, "stats_unavailable": 0, "actual_mib": 0}
 # cycle would re-introduce the starvation the batch fix removed: a wedged head would
 # simply consume the attempt budget every cycle instead of the whole list.
 _balloon_deflate_cursor = 0
+# Rotating start offset for the per-VM scan (the statistics GET). Pairs with the
+# cycle time budget: a pass cut short by the budget resumes where it stopped, so no
+# tenant is permanently invisible to the controller.
+_balloon_scan_cursor = 0
 # Last COMPLETED cycle, published atomically at the end of _adjust_balloons and
 # read by /metrics. None until the controller has run once.
 _balloon_metrics = None
@@ -2316,7 +2327,7 @@ def _inflate_balloon(tid, sock_file, vm_mem_mb, stats, host_available):
     return True
 
 
-def _deflate_balloon_batch(candidates, host_available):
+def _deflate_balloon_batch(candidates, host_available, deadline=None):
     remaining_budget = max(
         0, BALLOON_MAX_ACTIONS_PER_CYCLE - _balloon_cycle["actions"]
     )
@@ -2354,40 +2365,62 @@ def _deflate_balloon_batch(candidates, host_available):
     for tid, sock_file, staged_mib, identity in ordered:
         if done >= want or attempts >= BALLOON_MAX_ATTEMPTS_PER_CYCLE:
             break
+        if deadline is not None and time.monotonic() >= deadline:
+            print("balloon deflate stopped: cycle time budget reached")
+            break
         attempts += 1
-        # Re-read immediately before acting. The candidate list was built earlier in
-        # this cycle; a VM stopped and relaunched since then is reachable at the same
-        # fc.sock path, and applying a target computed for the previous incarnation
-        # would silently INFLATE a fresh VM that asked for nothing.
-        fresh = _get_balloon_stats(sock_file)
-        if not fresh:
-            print(f"balloon deflate skip {tid}: statistics unreadable at apply time")
-            continue
-        if identity is not None:
-            fresh_ticks = _read_proc_start_ticks(identity[0])
-            if fresh_ticks is None or fresh_ticks != identity[1]:
+        # Hold the per-tenant lifecycle lock across re-read, identity check and PATCH.
+        # Re-reading alone narrows the window but does not close it: launch/stop/
+        # delete/migrate all take this same flock, so taking it non-blocking here is
+        # what makes "the VM cannot be replaced under us mid-decision" true rather
+        # than merely unlikely. wait_sec=0 because the agent is a single-threaded tick
+        # loop — never block it; a busy tenant is simply skipped this cycle.
+        lock_fd = _acquire_tenant_lock(tid, wait_sec=0, who="balloon")
+        if lock_fd is None:
+            continue  # someone is mid-lifecycle on this tenant; next cycle
+        try:
+            fresh = _get_balloon_stats(sock_file)
+            if not fresh:
                 print(
-                    f"balloon deflate skip {tid}: VM identity changed "
-                    f"pid={identity[0]} start_ticks {identity[1]}→{fresh_ticks}, "
-                    "stale target discarded"
+                    f"balloon deflate skip {tid}: statistics unreadable at apply time"
                 )
                 continue
-        fresh_mib = int(fresh.get("actual_mib", 0) or 0)
-        fresh_target = int(fresh.get("target_mib", 0) or 0)
-        if fresh_mib <= 0 and fresh_target <= 0:
-            continue  # nothing left to lower
-        new_target = max(0, fresh_mib - BALLOON_STEP_MIB)
-        if new_target >= fresh_target and fresh_target > 0:
-            continue  # would not lower anything
-        if not _set_balloon_target(sock_file, new_target):
-            continue  # failure already logged; do not count an action
-        done += 1
-        _balloon_cycle["actions"] += 1
-        print(
-            f"balloon deflate {tid}: {fresh_mib}→{new_target}MB "
-            f"(step={fresh_mib - new_target}MB staged={staged_mib}MB "
-            f"host_avail={host_available}MB)"
-        )
+            if identity is not None:
+                fresh_ticks = _read_proc_start_ticks(identity[0])
+                if fresh_ticks is None or fresh_ticks != identity[1]:
+                    print(
+                        f"balloon deflate skip {tid}: VM identity changed "
+                        f"pid={identity[0]} start_ticks {identity[1]}→{fresh_ticks}, "
+                        "stale target discarded"
+                    )
+                    continue
+            fresh_mib = int(fresh.get("actual_mib", 0) or 0)
+            fresh_target = int(fresh.get("target_mib", 0) or 0)
+            if fresh_mib <= 0 and fresh_target <= 0:
+                continue  # nothing left to lower
+            new_target = max(0, fresh_mib - BALLOON_STEP_MIB)
+            # Deflation must NEVER raise the current target. The `fresh_target > 0`
+            # qualifier that used to guard this was the hole: with target already at
+            # 0 and the guest still holding pages (actual_mib > step, drain in
+            # flight), `new_target` is positive, the qualifier short-circuited the
+            # guard, and the PATCH would push the target back UP — reversing a full
+            # deflate already underway.
+            if new_target >= fresh_target:
+                continue  # would not lower anything
+            if not _set_balloon_target(sock_file, new_target):
+                continue  # failure already logged; do not count an action
+            done += 1
+            _balloon_cycle["actions"] += 1
+            print(
+                f"balloon deflate {tid}: {fresh_mib}→{new_target}MB "
+                f"(step={fresh_mib - new_target}MB staged={staged_mib}MB "
+                f"host_avail={host_available}MB)"
+            )
+        finally:
+            try:
+                os.close(lock_fd)  # closing the fd releases the flock
+            except OSError:
+                pass
     _balloon_deflate_cursor = (start + attempts) % total
     if attempts >= BALLOON_MAX_ATTEMPTS_PER_CYCLE and done < want:
         print(
@@ -2424,8 +2457,27 @@ def _adjust_balloons(probe_results):
 
     host_pressure = host_available / host_total  # 0.0 = no memory, 1.0 = all free
     deflate_candidates = []
+    deadline = time.monotonic() + BALLOON_CYCLE_BUDGET_SEC
 
-    for tid, info in probe_results.items():
+    # Rotate the scan start so a pass cut short by the time budget resumes where it
+    # stopped. Without this, a fleet whose first VMs have slow sockets would consume
+    # the whole budget every cycle and the tail would never be looked at.
+    global _balloon_scan_cursor
+    tids = list(probe_results)
+    scan_start = _balloon_scan_cursor % len(tids) if tids else 0
+    tids = tids[scan_start:] + tids[:scan_start]
+    scanned = 0
+    inflate_attempts = 0
+
+    for tid in tids:
+        if time.monotonic() >= deadline:
+            print(
+                f"balloon cycle time budget {BALLOON_CYCLE_BUDGET_SEC}s reached after "
+                f"{scanned}/{len(tids)} VMs; the rest resume next cycle"
+            )
+            break
+        scanned += 1
+        info = probe_results[tid]
         state = _balloon_vm_state(tid, info)
         if state is None:
             continue
@@ -2437,6 +2489,16 @@ def _adjust_balloons(probe_results):
             if _balloon_cycle["actions"] >= BALLOON_MAX_ACTIONS_PER_CYCLE:
                 print("balloon action budget exhausted for this cycle")
                 break
+            # Attempts, not just landings: a failing PATCH costs the same wall clock
+            # as a successful one, and only landings incremented `actions`, so a fleet
+            # of failing inflates was unbounded on this path too.
+            if inflate_attempts >= BALLOON_MAX_ATTEMPTS_PER_CYCLE:
+                print(
+                    f"balloon inflate attempt budget reached: attempts="
+                    f"{inflate_attempts} landed={_balloon_cycle['actions']}"
+                )
+                break
+            inflate_attempts += 1
             if _inflate_balloon(tid, sock_file, vm_mem_mb, stats, host_available):
                 _balloon_cycle["actions"] += 1
         elif host_pressure > 0.40 and (
@@ -2452,8 +2514,10 @@ def _adjust_balloons(probe_results):
                 (tid, sock_file, current_balloon_mib, _fc_identity(info))
             )
 
+    _balloon_scan_cursor = (scan_start + scanned) % len(tids) if tids else 0
+
     if host_pressure > 0.40:
-        _deflate_balloon_batch(deflate_candidates, host_available)
+        _deflate_balloon_batch(deflate_candidates, host_available, deadline)
 
     # Publish by rebinding a module global (atomic under the GIL) instead of
     # letting /metrics read the live accumulator. A scrape that landed mid-cycle

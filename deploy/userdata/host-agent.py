@@ -196,6 +196,17 @@ def _render_metrics_text(
             "openclaw_host_balloon_actions"
             f" {int(balloon_stats.get('actions') or 0)}"
         )
+        out.append(
+            "# HELP openclaw_host_balloon_lock_contended tenants skipped in the last"
+            " controller cycle because their lifecycle lock was held (launch/stop/"
+            "delete/migrate/backup in flight). Persistently non-zero means the"
+            " controller is not reaching those tenants at all."
+        )
+        out.append("# TYPE openclaw_host_balloon_lock_contended gauge")
+        out.append(
+            "openclaw_host_balloon_lock_contended"
+            f" {int(balloon_stats.get('lock_contended') or 0)}"
+        )
     # Grafana 侧算比率,避免 agent 侧固化一个除法口径。stranding=None → 整组省略。
     if isinstance(stranding, tuple) and len(stranding) == 4:
         s_vcpu, s_mem, alloc_v, alloc_m = stranding
@@ -426,7 +437,12 @@ _lock = threading.Lock()
 # Balloon controller counters, reset each _adjust_balloons cycle. Exposed on
 # /metrics so a silently inert controller is visible instead of invisible
 # (the failure mode this issue was filed for).
-_balloon_cycle = {"actions": 0, "stats_unavailable": 0, "actual_mib": 0}
+_balloon_cycle = {
+    "actions": 0,
+    "stats_unavailable": 0,
+    "actual_mib": 0,
+    "lock_contended": 0,
+}
 # Rotating start offset for the deflate walk. Without it, bounding the attempts per
 # cycle would re-introduce the starvation the batch fix removed: a wedged head would
 # simply consume the attempt budget every cycle instead of the whole list.
@@ -2377,6 +2393,11 @@ def _deflate_balloon_batch(candidates, host_available, deadline=None):
         # loop — never block it; a busy tenant is simply skipped this cycle.
         lock_fd = _acquire_tenant_lock(tid, wait_sec=0, who="balloon")
         if lock_fd is None:
+            # Count it. A tenant whose lock is held every cycle would otherwise be
+            # invisible — the controller would look healthy while never touching it,
+            # which is the exact failure shape this controller was rewritten to end.
+            # Not logged per occurrence: at a 5s cadence that would be pure spam.
+            _balloon_cycle["lock_contended"] += 1
             continue  # someone is mid-lifecycle on this tenant; next cycle
         try:
             fresh = _get_balloon_stats(sock_file)
@@ -2450,7 +2471,9 @@ def _adjust_balloons(probe_results):
     if not BALLOON_ENABLED:
         return
 
-    _balloon_cycle.update(actions=0, stats_unavailable=0, actual_mib=0)
+    _balloon_cycle.update(
+        actions=0, stats_unavailable=0, actual_mib=0, lock_contended=0
+    )
     host_total, host_available = _get_host_mem_info()
     if host_total == 0:
         return

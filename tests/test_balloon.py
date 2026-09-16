@@ -456,7 +456,12 @@ class TestBalloonController:
 
     @pytest.mark.unit
     def test_deflate_skips_a_tenant_whose_lifecycle_lock_is_held(self, tmp_path):
-        """A tenant mid launch/stop/delete/migrate must be left alone this cycle."""
+        """A tenant mid launch/stop/delete/migrate must be left alone — and counted.
+
+        Skipping silently would make a tenant whose lock is held every cycle invisible:
+        the controller would look healthy while never touching it, which is the exact
+        failure shape this controller was rewritten to end.
+        """
         tenant_id = "tenant-a"
         agent.VM_DIR = str(tmp_path)
         _make_vm(tmp_path, tenant_id)
@@ -471,6 +476,9 @@ class TestBalloonController:
             agent._adjust_balloons({tenant_id: {"vm_health": "up"}})
 
         set_target.assert_not_called()
+        assert agent._balloon_cycle["lock_contended"] == 1
+        rendered = agent._render_metrics_text({}, balloon_stats=agent._balloon_metrics)
+        assert "openclaw_host_balloon_lock_contended 1" in rendered
 
     @pytest.mark.unit
     def test_cycle_time_budget_bounds_the_statistics_scan(self, tmp_path, capsys):
@@ -670,6 +678,7 @@ class TestBalloonController:
             "actions": 0,
             "stats_unavailable": 0,
             "actual_mib": 128,
+            "lock_contended": 0,
         }
         # Published snapshot must be a copy, not the live accumulator, so a
         # scrape that lands mid-cycle cannot observe the post-reset zeros.

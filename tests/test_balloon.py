@@ -788,3 +788,33 @@ class TestBalloonController:
         assert "openclaw_host_balloon_actual_mib 256" in with_balloon
         assert "openclaw_host_balloon_stats_unavailable 2" in with_balloon
         assert "openclaw_host_balloon_actions 1" in with_balloon
+
+    @pytest.mark.unit
+    def test_balloon_api_calls_carry_an_explicit_max_time(self):
+        """Per-call timeout bounds one VM; the cycle budgets only bound how many.
+
+        The acted-on path costs two GETs plus a PATCH, and the budget checks sit
+        between VMs, not inside one — so without a per-call ceiling a single hung
+        socket still holds the poll loop.
+        """
+        captured = []
+
+        class _R:
+            returncode = 0
+            stdout = '{"target_mib": 0, "actual_mib": 0}'
+            stderr = b""
+
+        def record(argv, **kwargs):
+            captured.append((argv, kwargs))
+            return _R()
+
+        with patch.object(agent.subprocess, "run", side_effect=record):
+            agent._get_balloon_stats("/tmp/fc.sock")
+            agent._set_balloon_target("/tmp/fc.sock", 64)
+
+        assert len(captured) == 2
+        for argv, kwargs in captured:
+            assert "--max-time" in argv, argv
+            idx = argv.index("--max-time")
+            assert float(argv[idx + 1]) == agent.BALLOON_API_TIMEOUT_SEC
+            assert kwargs["timeout"] == agent.BALLOON_API_TIMEOUT_SEC + 1

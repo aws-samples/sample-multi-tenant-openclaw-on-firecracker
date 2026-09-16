@@ -428,6 +428,19 @@ BALLOON_CYCLE_BUDGET_SEC = float(os.environ.get("BALLOON_CYCLE_BUDGET_SEC", "2.0
 # tenant memory unrecoverable. Worst case per cycle is now scan + action, both under
 # the 5s poll interval combined.
 BALLOON_ACTION_BUDGET_SEC = float(os.environ.get("BALLOON_ACTION_BUDGET_SEC", "1.0"))
+# Per-call timeout for the balloon API, now also passed to curl as --max-time so curl
+# gives up on its own instead of relying solely on the subprocess kill.
+#
+# Kept at the pre-existing 5s on purpose. The acted-on path costs two GETs plus a PATCH
+# (the scan reads, then the locked apply re-reads), and the per-cycle budgets bound how
+# MANY VMs are touched but cannot bound a single hung socket — the checks sit between
+# VMs, not inside one. So one pathological VM can still hold the poll loop for roughly
+# three call timeouts, about 15s, not the cycle budget. Lowering this shrinks that bound
+# but risks manufacturing spurious `stats_unavailable` and failed PATCHes if the
+# Firecracker API is ever slower than the new value under real fleet density, which is
+# not something this branch measured. Left as a knob for an operator who has measured
+# their own latency distribution.
+BALLOON_API_TIMEOUT_SEC = float(os.environ.get("BALLOON_API_TIMEOUT_SEC", "5.0"))
 BALLOON_ALLOW_BLIND_INFLATE = (
     os.environ.get("BALLOON_ALLOW_BLIND_INFLATE", "false").lower() == "true"
 )
@@ -2162,13 +2175,15 @@ def _get_balloon_stats(sock_file):
             [
                 "curl",
                 "-sf",
+                "--max-time",
+                str(BALLOON_API_TIMEOUT_SEC),
                 "--unix-socket",
                 sock_file,
                 "http://localhost/balloon/statistics",
             ],
             capture_output=True,
             text=True,
-            timeout=5,
+            timeout=BALLOON_API_TIMEOUT_SEC + 1,
         )
         if r.returncode == 0 and r.stdout.strip():
             return json.loads(r.stdout)
@@ -2191,6 +2206,8 @@ def _set_balloon_target(sock_file, amount_mib):
             [
                 "curl",
                 "-sf",
+                "--max-time",
+                str(BALLOON_API_TIMEOUT_SEC),
                 "--unix-socket",
                 sock_file,
                 "-X",
@@ -2202,7 +2219,7 @@ def _set_balloon_target(sock_file, amount_mib):
                 json.dumps({"amount_mib": amount_mib}),
             ],
             capture_output=True,
-            timeout=5,
+            timeout=BALLOON_API_TIMEOUT_SEC + 1,
         )
     except Exception as e:
         print(f"balloon set failed: {e}")

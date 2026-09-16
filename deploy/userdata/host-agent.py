@@ -420,7 +420,14 @@ BALLOON_MAX_ATTEMPTS_PER_CYCLE = int(
 # the poll loop for minutes ahead of the heartbeat and the DDB reconcile. Under the
 # 5s poll interval so a slow pass cannot pile up. The scan start rotates, so a
 # truncated pass still covers the rest of the fleet on the next cycles.
-BALLOON_CYCLE_BUDGET_SEC = float(os.environ.get("BALLOON_CYCLE_BUDGET_SEC", "3.0"))
+BALLOON_CYCLE_BUDGET_SEC = float(os.environ.get("BALLOON_CYCLE_BUDGET_SEC", "2.0"))
+# Deflation gets its OWN budget, granted AFTER the scan finishes. Sharing a single
+# cycle deadline was a starvation bug: a fleet of slow sockets consumed the whole
+# budget during the statistics scan, so the deflate walk hit an already-expired
+# deadline on its first check and issued zero PATCHes — every cycle, forever, leaving
+# tenant memory unrecoverable. Worst case per cycle is now scan + action, both under
+# the 5s poll interval combined.
+BALLOON_ACTION_BUDGET_SEC = float(os.environ.get("BALLOON_ACTION_BUDGET_SEC", "1.0"))
 BALLOON_ALLOW_BLIND_INFLATE = (
     os.environ.get("BALLOON_ALLOW_BLIND_INFLATE", "false").lower() == "true"
 )
@@ -2299,7 +2306,49 @@ def _balloon_inflate_converged(tid, stats):
     return False
 
 
-def _inflate_balloon(tid, sock_file, vm_mem_mb, stats, host_available):
+def _inflate_balloon(tid, sock_file, vm_mem_mb, stats, host_available, identity=None):
+    """Raise this VM's balloon target by one clamped step. True only if a PATCH landed.
+
+    Holds the per-tenant lifecycle lock across re-read, identity check and PATCH, for
+    the same reason the deflate path does — and the consequence here is worse. The step
+    is computed as `actual_mib + step`, so if the VM were replaced between the staged
+    read and the PATCH, a fresh VM sitting at `actual_mib=0` would receive the previous
+    incarnation's accumulated target plus a step in a single write, blowing straight
+    past the one-step limit and the ratio cap and squeezing a guest that asked for
+    nothing.
+    """
+    lock_fd = _acquire_tenant_lock(tid, wait_sec=0, who="balloon")
+    if lock_fd is None:
+        _balloon_cycle["lock_contended"] += 1
+        return False
+    try:
+        return _inflate_balloon_locked(
+            tid, sock_file, vm_mem_mb, stats, host_available, identity
+        )
+    finally:
+        try:
+            os.close(lock_fd)  # closing the fd releases the flock
+        except OSError:
+            pass
+
+
+def _inflate_balloon_locked(tid, sock_file, vm_mem_mb, stats, host_available, identity):
+    if identity is not None:
+        fresh_ticks = _read_proc_start_ticks(identity[0])
+        if fresh_ticks is None or fresh_ticks != identity[1]:
+            print(
+                f"balloon inflate skip {tid}: VM identity changed "
+                f"pid={identity[0]} start_ticks {identity[1]}→{fresh_ticks}, "
+                "staged step discarded"
+            )
+            return False
+    fresh = _get_balloon_stats(sock_file)
+    if not fresh:
+        print(f"balloon inflate skip {tid}: statistics unreadable at apply time")
+        return False
+    if not _balloon_inflate_converged(tid, fresh):
+        return False
+    stats = fresh
     current_balloon_mib = int(stats.get("actual_mib", 0) or 0)
     cap = int(vm_mem_mb * BALLOON_MAX_INFLATE_RATIO)
     available_mib = _balloon_available_mib(stats)
@@ -2522,7 +2571,14 @@ def _adjust_balloons(probe_results):
                 )
                 break
             inflate_attempts += 1
-            if _inflate_balloon(tid, sock_file, vm_mem_mb, stats, host_available):
+            if _inflate_balloon(
+                tid,
+                sock_file,
+                vm_mem_mb,
+                stats,
+                host_available,
+                _fc_identity(info),
+            ):
                 _balloon_cycle["actions"] += 1
         elif host_pressure > 0.40 and (
             current_balloon_mib > 0 or int(stats.get("target_mib", 0) or 0) > 0
@@ -2540,7 +2596,12 @@ def _adjust_balloons(probe_results):
     _balloon_scan_cursor = (scan_start + scanned) % len(tids) if tids else 0
 
     if host_pressure > 0.40:
-        _deflate_balloon_batch(deflate_candidates, host_available, deadline)
+        # Fresh deadline, not the scan's: see BALLOON_ACTION_BUDGET_SEC.
+        _deflate_balloon_batch(
+            deflate_candidates,
+            host_available,
+            time.monotonic() + BALLOON_ACTION_BUDGET_SEC,
+        )
 
     # Publish by rebinding a module global (atomic under the GIL) instead of
     # letting /metrics read the live accumulator. A scrape that landed mid-cycle

@@ -88,6 +88,7 @@ class TestBalloonController:
         agent.BALLOON_ALLOW_BLIND_INFLATE = False
         agent.BALLOON_MAX_ATTEMPTS_PER_CYCLE = 10
         agent.BALLOON_CYCLE_BUDGET_SEC = 30.0
+        agent.BALLOON_ACTION_BUDGET_SEC = 30.0
         agent._balloon_deflate_cursor = 0
         agent._balloon_scan_cursor = 0
 
@@ -479,6 +480,92 @@ class TestBalloonController:
         assert agent._balloon_cycle["lock_contended"] == 1
         rendered = agent._render_metrics_text({}, balloon_stats=agent._balloon_metrics)
         assert "openclaw_host_balloon_lock_contended 1" in rendered
+
+    @pytest.mark.unit
+    def test_inflate_skips_a_replaced_vm(self, tmp_path, capsys):
+        """Inflate computes actual+step, so a stale read is worse here than on deflate.
+
+        A fresh VM sitting at actual_mib=0 would receive the previous incarnation's
+        accumulated target plus a step in one write, blowing past both the single-step
+        limit and the ratio cap.
+        """
+        tenant_id = "tenant-a"
+        agent.VM_DIR = str(tmp_path)
+        _make_vm(tmp_path, tenant_id)
+        stats = {
+            "available_memory": 1024 * 1024 * 1024,
+            "target_mib": 512,
+            "actual_mib": 512,
+        }
+
+        with (
+            patch.object(agent, "_get_host_mem_info", return_value=(1000, 100)),
+            patch.object(agent, "_get_balloon_stats", return_value=stats),
+            patch.object(agent, "_read_proc_start_ticks", side_effect=[111, 222]),
+            patch.object(agent, "_set_balloon_target") as set_target,
+        ):
+            agent._adjust_balloons(
+                {tenant_id: {"vm_health": "up", "fc_pid": 4242}}
+            )
+
+        set_target.assert_not_called()
+        assert "balloon inflate skip" in capsys.readouterr().out
+
+    @pytest.mark.unit
+    def test_inflate_skips_a_tenant_whose_lifecycle_lock_is_held(self, tmp_path):
+        tenant_id = "tenant-a"
+        agent.VM_DIR = str(tmp_path)
+        _make_vm(tmp_path, tenant_id)
+        stats = {
+            "available_memory": 1024 * 1024 * 1024,
+            "target_mib": 0,
+            "actual_mib": 0,
+        }
+
+        with (
+            patch.object(agent, "_get_host_mem_info", return_value=(1000, 100)),
+            patch.object(agent, "_get_balloon_stats", return_value=stats),
+            patch.object(agent, "_acquire_tenant_lock", return_value=None),
+            patch.object(agent, "_set_balloon_target") as set_target,
+        ):
+            agent._adjust_balloons({tenant_id: {"vm_health": "up"}})
+
+        set_target.assert_not_called()
+        assert agent._balloon_cycle["lock_contended"] == 1
+
+    @pytest.mark.unit
+    def test_deflate_still_runs_when_the_scan_consumed_its_budget(self, tmp_path):
+        """A slow scan must not starve deflation forever.
+
+        Sharing one deadline between the scan and the deflate walk meant a fleet of
+        slow sockets burned the whole budget reading statistics, so the walk hit an
+        already-expired deadline and issued zero PATCHes on every cycle.
+        """
+        agent.VM_DIR = str(tmp_path)
+        agent.BALLOON_CYCLE_BUDGET_SEC = 0.05
+        agent.BALLOON_ACTION_BUDGET_SEC = 5.0
+        agent.BALLOON_DEFLATE_BATCH = 2
+        probe_results = {}
+        for index in range(6):
+            tenant_id = f"tenant-{index}"
+            _make_vm(tmp_path, tenant_id)
+            probe_results[tenant_id] = {"vm_health": "up"}
+        stats = {"target_mib": 128, "actual_mib": 128}
+
+        def slow_stats(sock_file):
+            time.sleep(0.02)
+            return stats
+
+        with (
+            patch.object(agent, "_get_host_mem_info", return_value=(1000, 500)),
+            patch.object(agent, "_get_balloon_stats", side_effect=slow_stats),
+            patch.object(agent, "_set_balloon_target", return_value=True) as set_target,
+        ):
+            agent._adjust_balloons(probe_results)
+
+        assert set_target.call_count >= 1, (
+            "deflation must get its own budget, not the scan's leftovers"
+        )
 
     @pytest.mark.unit
     def test_cycle_time_budget_bounds_the_statistics_scan(self, tmp_path, capsys):

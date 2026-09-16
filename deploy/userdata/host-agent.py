@@ -91,7 +91,11 @@ _PROM_GAUGES = (
 
 
 def _render_metrics_text(
-    snapshots, port_stats=None, agent_stats=None, stranding=None
+    snapshots,
+    port_stats=None,
+    agent_stats=None,
+    stranding=None,
+    balloon_stats=None,
 ):
     """Render the in-memory snapshots dict as Prometheus exposition text.
 
@@ -160,6 +164,34 @@ def _render_metrics_text(
         out.append("# TYPE openclaw_host_dnat_ports_quarantined gauge")
         out.append(
             f"openclaw_host_dnat_ports_quarantined {int(port_stats['quarantined'])}"
+        )
+    if isinstance(balloon_stats, dict):
+        out.append(
+            "# HELP openclaw_host_balloon_reclaimed_mib memory currently"
+            " reclaimed from inspected VMs (MiB)"
+        )
+        out.append("# TYPE openclaw_host_balloon_reclaimed_mib gauge")
+        out.append(
+            "openclaw_host_balloon_reclaimed_mib"
+            f" {int(balloon_stats.get('reclaimed_mib') or 0)}"
+        )
+        out.append(
+            "# HELP openclaw_host_balloon_stats_unavailable VMs whose balloon"
+            " statistics were unavailable in the last controller cycle"
+        )
+        out.append("# TYPE openclaw_host_balloon_stats_unavailable gauge")
+        out.append(
+            "openclaw_host_balloon_stats_unavailable"
+            f" {int(balloon_stats.get('stats_unavailable') or 0)}"
+        )
+        out.append(
+            "# HELP openclaw_host_balloon_actions balloon target changes issued"
+            " in the last controller cycle"
+        )
+        out.append("# TYPE openclaw_host_balloon_actions gauge")
+        out.append(
+            "openclaw_host_balloon_actions"
+            f" {int(balloon_stats.get('actions') or 0)}"
         )
     # Grafana 侧算比率,避免 agent 侧固化一个除法口径。stranding=None → 整组省略。
     if isinstance(stranding, tuple) and len(stranding) == 4:
@@ -352,6 +384,18 @@ BALLOON_MAX_INFLATE_RATIO = float(os.environ.get("BALLOON_MAX_INFLATE_RATIO", "0
 BALLOON_MIN_GUEST_AVAILABLE_MB = int(
     os.environ.get("BALLOON_MIN_GUEST_AVAILABLE_MB", "512")
 )
+BALLOON_STEP_MIB = int(os.environ.get("BALLOON_STEP_MIB", "64"))
+BALLOON_CUSHION_MIB = int(os.environ.get("BALLOON_CUSHION_MIB", "64"))
+BALLOON_CONVERGE_TOLERANCE_MIB = int(
+    os.environ.get("BALLOON_CONVERGE_TOLERANCE_MIB", "16")
+)
+BALLOON_MAX_ACTIONS_PER_CYCLE = int(
+    os.environ.get("BALLOON_MAX_ACTIONS_PER_CYCLE", "20")
+)
+BALLOON_DEFLATE_BATCH = int(os.environ.get("BALLOON_DEFLATE_BATCH", "5"))
+BALLOON_ALLOW_BLIND_INFLATE = (
+    os.environ.get("BALLOON_ALLOW_BLIND_INFLATE", "false").lower() == "true"
+)
 
 # DynamoDB client (region auto-detected from instance metadata)
 _ddb = None
@@ -361,6 +405,14 @@ _consecutive_cred_failures = 0
 _CRED_FAILURE_EXIT_THRESHOLD = int(os.environ.get("AGENT_CRED_FAIL_EXIT_THRESHOLD", "12"))
 _status = {}
 _lock = threading.Lock()
+
+# Balloon controller counters, reset each _adjust_balloons cycle. Exposed on
+# /metrics so a silently inert controller is visible instead of invisible
+# (the failure mode this issue was filed for).
+_balloon_cycle = {"actions": 0, "stats_unavailable": 0, "reclaimed_mib": 0}
+# Last COMPLETED cycle, published atomically at the end of _adjust_balloons and
+# read by /metrics. None until the controller has run once.
+_balloon_metrics = None
 
 # _status is a tenant map; a host-level key mixed in would be rendered as a
 # phantom tenant by the per-tenant gauge loops above. Guarded by _lock (same
@@ -1821,6 +1873,27 @@ def _get_disk_usage(data_file):
         return 0, 0, 0
 
 
+def _balloon_available_mib(stats):
+    """Guest available memory in MiB from BalloonStats, or None if unusable.
+
+    `available_memory` is a TOP-LEVEL field of BalloonStats (Firecracker v1.15.1
+    swagger), in bytes. It is only populated when the device was configured
+    pre-boot with stats_polling_interval_s > 0 AND the guest driver negotiated
+    the stats virtqueue. Returns None — never 0 — when the value is absent or
+    non-positive, because "missing" and "zero free memory" must not collapse
+    into the same decision.
+    """
+    available_bytes = stats.get("available_memory") if isinstance(stats, dict) else None
+    if (
+        not isinstance(available_bytes, (int, float))
+        or isinstance(available_bytes, bool)
+        or available_bytes <= 0
+    ):
+        return None
+    available_mib = int(available_bytes) // (1024 * 1024)
+    return available_mib if available_mib > 0 else None
+
+
 def _get_memory_usage(stats, vm_mem_mb):
     """Compute (used_mb, balloon_mib) from balloon /statistics response.
 
@@ -1830,10 +1903,11 @@ def _get_memory_usage(stats, vm_mem_mb):
     """
     if not stats:
         return 0, 0
-    available_bytes = stats.get("stats", {}).get("available_memory", 0)
-    available_mb = available_bytes // (1024 * 1024)
-    used_mb = max(0, vm_mem_mb - available_mb)
     balloon_mib = stats.get("actual_mib", 0)
+    available_mb = _balloon_available_mib(stats)
+    if available_mb is None:
+        return 0, balloon_mib
+    used_mb = max(0, vm_mem_mb - available_mb)
     return used_mb, balloon_mib
 
 
@@ -2095,71 +2169,176 @@ def _get_host_mem_info():
         return 0, 0
 
 
+def _balloon_vm_state(tid, info):
+    """Return balloon inputs for an eligible VM, or None when it must be skipped."""
+    if info.get("vm_health") != "up":
+        return None
+    sock_file = os.path.join(VM_DIR, tid, "fc.sock")
+    if not os.path.exists(sock_file):
+        return None
+
+    cfg_file = os.path.join(VM_DIR, tid, "vm.json")
+    try:
+        with open(cfg_file, encoding="utf-8") as f:
+            cfg = json.load(f)
+        vm_mem_mb = cfg.get("mem_mb", 4096)
+    except Exception:
+        return None
+
+    stats = _get_balloon_stats(sock_file)
+    if not stats:
+        print(f"balloon stats unavailable {tid}: cannot inspect balloon state")
+        _balloon_cycle["stats_unavailable"] += 1
+        return None
+    # Count an unusable available_memory here rather than inside the inflate
+    # path: the inflate path only runs under host pressure, so an operator
+    # would not learn that the signal is broken until the moment it is needed.
+    # This gauge exists to surface exactly that, so it must be branch-independent.
+    if _balloon_available_mib(stats) is None:
+        _balloon_cycle["stats_unavailable"] += 1
+    current_balloon_mib = int(stats.get("actual_mib", 0) or 0)
+    _balloon_cycle["reclaimed_mib"] += current_balloon_mib
+    return sock_file, vm_mem_mb, stats, current_balloon_mib
+
+
+def _balloon_stats_converged(tid, stats):
+    target_mib = int(stats.get("target_mib", 0) or 0)
+    actual_mib = int(stats.get("actual_mib", 0) or 0)
+    if abs(target_mib - actual_mib) <= BALLOON_CONVERGE_TOLERANCE_MIB:
+        return True
+    print(
+        f"balloon skip {tid}: target={target_mib}MiB actual={actual_mib}MiB "
+        f"not converged (tolerance={BALLOON_CONVERGE_TOLERANCE_MIB}MiB)"
+    )
+    return False
+
+
+def _inflate_balloon(tid, sock_file, vm_mem_mb, stats, host_available):
+    current_balloon_mib = int(stats.get("actual_mib", 0) or 0)
+    cap = int(vm_mem_mb * BALLOON_MAX_INFLATE_RATIO)
+    available_mib = _balloon_available_mib(stats)
+    if available_mib is None:
+        # Already counted in _balloon_vm_state — warn only, do not double count.
+        print(
+            f"balloon stats unavailable {tid}: cannot size inflate safely "
+            "(available_memory missing or non-positive)"
+        )
+        if not BALLOON_ALLOW_BLIND_INFLATE:
+            return False
+        step = min(BALLOON_STEP_MIB, cap - current_balloon_mib)
+        reason = "blind_opt_in"
+        guest_available = "unavailable"
+    else:
+        headroom = (
+            available_mib
+            - BALLOON_MIN_GUEST_AVAILABLE_MB
+            - BALLOON_CUSHION_MIB
+        )
+        step = min(
+            BALLOON_STEP_MIB,
+            cap - current_balloon_mib,
+            max(0, headroom),
+        )
+        reason = "guest_headroom"
+        guest_available = f"{available_mib}MB"
+    if step <= 0:
+        return False
+
+    target = current_balloon_mib + step
+    _set_balloon_target(sock_file, target)
+    print(
+        f"balloon inflate {tid}: {current_balloon_mib}→{target}MB "
+        f"(step={step}MB reason={reason} host_avail={host_available}MB "
+        f"guest_avail={guest_available})"
+    )
+    return True
+
+
+def _deflate_balloon_batch(candidates, host_available):
+    remaining_budget = max(
+        0, BALLOON_MAX_ACTIONS_PER_CYCLE - _balloon_cycle["actions"]
+    )
+    batch = candidates[: min(BALLOON_DEFLATE_BATCH, remaining_budget)]
+    if candidates and not batch:
+        print("balloon action budget exhausted for this cycle")
+        return
+    required_mib = len(batch) * BALLOON_STEP_MIB
+    if host_available < required_mib:
+        print(
+            f"balloon deflate skipped: host_avail={host_available}MB cannot "
+            f"absorb batch={len(batch)} step={BALLOON_STEP_MIB}MB "
+            f"required={required_mib}MB"
+        )
+        return
+    for tid, sock_file, current_balloon_mib in batch:
+        new_target = max(0, current_balloon_mib - BALLOON_STEP_MIB)
+        _set_balloon_target(sock_file, new_target)
+        _balloon_cycle["actions"] += 1
+        print(
+            f"balloon deflate {tid}: {current_balloon_mib}→{new_target}MB "
+            f"(step={current_balloon_mib - new_target}MB "
+            f"host_avail={host_available}MB)"
+        )
+    if _balloon_cycle["actions"] >= BALLOON_MAX_ACTIONS_PER_CYCLE:
+        print("balloon action budget exhausted for this cycle")
+
+
 def _adjust_balloons(probe_results):
     """Dynamically adjust balloon sizes based on host memory pressure.
 
     Strategy:
     - If host available memory < 20% of total → inflate balloons on VMs with spare memory
-    - If host available memory > 40% of total → deflate balloons to give memory back
+    - If host available memory > 40% of total → deflate balloons, stepwise, in batches
     - Never inflate beyond max_inflate_ratio of VM's declared memory
-    - Never reduce guest available below min_guest_available_mb
+    - Never reduce guest available below min_guest_available_mb (+ cushion)
+    - One step is at most BALLOON_STEP_MIB; a VM whose target and actual have not
+      converged is skipped, because Firecracker cannot control how fast the guest
+      driver reaches a target and stacking targets makes the driver spin
+    - Both directions share BALLOON_MAX_ACTIONS_PER_CYCLE, and deflate never
+      zeroes every target at once — the host must be able to absorb what is
+      handed back to the guests
+    - A missing or unusable available_memory is reported, never treated as zero
     """
     if not BALLOON_ENABLED:
         return
 
+    _balloon_cycle.update(actions=0, stats_unavailable=0, reclaimed_mib=0)
     host_total, host_available = _get_host_mem_info()
     if host_total == 0:
         return
 
     host_pressure = host_available / host_total  # 0.0 = no memory, 1.0 = all free
+    deflate_candidates = []
 
     for tid, info in probe_results.items():
-        if info.get("vm_health") != "up":
+        state = _balloon_vm_state(tid, info)
+        if state is None:
             continue
-        sock_file = os.path.join(VM_DIR, tid, "fc.sock")
-        if not os.path.exists(sock_file):
-            continue
-
-        # Read VM config for declared memory
-        cfg_file = os.path.join(VM_DIR, tid, "vm.json")
-        try:
-            with open(cfg_file, encoding="utf-8") as f:
-                cfg = json.load(f)
-            vm_mem_mb = cfg.get("mem_mb", 4096)
-        except Exception:
-            continue
-
-        stats = _get_balloon_stats(sock_file)
-        if not stats:
-            continue
-
-        current_balloon_mib = stats.get("actual_mib", 0)
-        max_balloon = int(vm_mem_mb * BALLOON_MAX_INFLATE_RATIO)
-
-        # Guest available memory (from balloon stats)
-        guest_available_mb = stats.get("stats", {}).get("available_memory", 0) // (
-            1024 * 1024
-        )
+        sock_file, vm_mem_mb, stats, current_balloon_mib = state
 
         if host_pressure < 0.20:
-            # Host under pressure — try to reclaim from this VM
-            reclaimable = guest_available_mb - BALLOON_MIN_GUEST_AVAILABLE_MB
-            if reclaimable > 0:
-                target = min(current_balloon_mib + reclaimable, max_balloon)
-                if target > current_balloon_mib:
-                    _set_balloon_target(sock_file, target)
-                    print(
-                        f"balloon inflate {tid}: {current_balloon_mib}→{target}MB "
-                        f"(host_avail={host_available}MB guest_avail={guest_available_mb}MB)"
-                    )
+            if not _balloon_stats_converged(tid, stats):
+                continue
+            if _balloon_cycle["actions"] >= BALLOON_MAX_ACTIONS_PER_CYCLE:
+                print("balloon action budget exhausted for this cycle")
+                break
+            if _inflate_balloon(tid, sock_file, vm_mem_mb, stats, host_available):
+                _balloon_cycle["actions"] += 1
+        elif host_pressure > 0.40 and current_balloon_mib > 0:
+            if _balloon_stats_converged(tid, stats):
+                deflate_candidates.append((tid, sock_file, current_balloon_mib))
 
-        elif host_pressure > 0.40:
-            # Host has plenty of memory — give back to VMs
-            if current_balloon_mib > 0:
-                _set_balloon_target(sock_file, 0)
-                print(
-                    f"balloon deflate {tid}: {current_balloon_mib}→0MB (host_avail={host_available}MB)"
-                )
+    if host_pressure > 0.40:
+        _deflate_balloon_batch(deflate_candidates, host_available)
+
+    # Publish by rebinding a module global (atomic under the GIL) instead of
+    # letting /metrics read the live accumulator. A scrape that landed mid-cycle
+    # would otherwise see the post-reset zeros — and this gauge group exists
+    # precisely so that "stats_unavailable > 0" is visible, so a transient 0
+    # would defeat it. Stays None until the first cycle finishes: no fake zeros,
+    # same convention as port_stats above.
+    global _balloon_metrics
+    _balloon_metrics = dict(_balloon_cycle)
 
 
 
@@ -4522,7 +4701,7 @@ class Handler(BaseHTTPRequestHandler):
                     port_stats = None
             stranding = _collect_stranding_stats()
             body = _render_metrics_text(
-                data, port_stats, agent_stats, stranding
+                data, port_stats, agent_stats, stranding, _balloon_metrics
             ).encode()
             self.send_response(200)
             self.send_header("Content-Type", "text/plain; version=0.0.4")

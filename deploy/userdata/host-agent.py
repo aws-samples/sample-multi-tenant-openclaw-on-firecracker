@@ -836,6 +836,27 @@ RECOVER_BACKOFF_SEC = float(os.environ.get("OC_RECOVER_BACKOFF", "15"))
 # 这个 set 只是省掉重复的 no-op 写。
 _phys_backfilled = set()
 
+# Tenants this process has PROVEN are past `creating`, so _write_ddb can skip the
+# promote conditional write for them.
+#
+# Why that write is pure waste: DynamoDB bills a conditional write whose condition
+# evaluates to false at the full item size, and a tenant that is already `running`
+# can never satisfy `#s = :c`. That is exactly why the base table burns 2x every
+# ALL-projection GSI — two base writes per tick (the doomed condition plus the
+# health refresh) against one index write, because a failed condition never
+# propagates to an index.
+#
+# Membership is PROVEN, never assumed. The CCF handler reads the stored item back
+# through ReturnValuesOnConditionCheckFailure and records a tenant only when its
+# stored status is something other than `creating`. A `vm_num` gate mismatch (stale
+# local vm.json) or an in-flight `dispatch_settle` both leave status AT `creating`,
+# and those must keep retrying — recording them would strand a promotable tenant.
+#
+# Same idiom and same bound as _phys_backfilled above: at most one entry per tenant
+# this host has ever seen. Cleared on restart, which costs one extra attempt per
+# tenant and is self-healing, not a defect.
+_promoted = set()
+
 # Dead-zone guard: FC alive but guest unreachable (e.g. TAP DOWN after a partial
 # launch) is invisible to _recover_vm, which only fires when FC is absent. After
 # this many consecutive unreachable polls, force a stop+relaunch.
@@ -1765,6 +1786,20 @@ def _write_ddb(results):
                     with _lock:
                         _agent_metrics["route_ensure_failures"] += 1
                     continue
+                # Proven past `creating`: skip the conditional write that can only
+                # fail and go straight to the health refresh.
+                #
+                # Placement is load-bearing — this sits AFTER _ensure_route on
+                # purpose. The host_port reconciliation on the refresh path depends
+                # on _ensure_route running EVERY tick and handing down the live
+                # value; skipping it together with the promote would leave a restored
+                # tenant advertising a legacy port that was never installed in
+                # iptables: unreachable while every health field reads green.
+                if tid in _promoted:
+                    _refresh_health(
+                        table, tid, info, now, metrics, host_port=host_port
+                    )
+                    continue
                 # NOTE: `metrics` is a DynamoDB reserved keyword, so it must be
                 # referenced via an ExpressionAttributeNames placeholder (#m).
                 # Same for `status` (#s, already aliased). Without #m the
@@ -1844,12 +1879,20 @@ def _write_ddb(results):
                         ConditionExpression=promote_cond,
                         ExpressionAttributeNames={"#s": "status", "#m": "metrics"},
                         ExpressionAttributeValues=update_vals,
+                        # Hand the stored item back when the condition fails, so the
+                        # handler below can tell the four CCF causes apart instead of
+                        # guessing. Free: "There is no additional cost associated with
+                        # requesting a return value... No read capacity units are
+                        # consumed." (UpdateItem API reference)
+                        ReturnValuesOnConditionCheckFailure="ALL_OLD",
                     )
                     print(
                         f"promoted {tid} creating → running "
                         f"(host={host_private_ip}:{host_port} guest={info['guest_ip']})"
                     )
-                except table.meta.client.exceptions.ConditionalCheckFailedException:
+                    # Past `creating` for good — stop paying for the condition.
+                    _promoted.add(tid)
+                except table.meta.client.exceptions.ConditionalCheckFailedException as ccf:
                     # promote's `#s = :c AND host_id = :self` lost: tenant is already
                     # running (normal — just refresh), deleted / migrated away, OR
                     # 【绝不复活】。回落 guarded refresh(attribute_exists(id) + host_id);
@@ -1860,6 +1903,26 @@ def _write_ddb(results):
                     # legacy 公式的产物(从未落到 iptables),在此顺带对账回真值:漂移一个 tick
                     # 内自动收敛,存量错值也一并自愈。promote 那条 `#s = :c` 闸门永远命中不到
                     # 它们,所以必须在这条回落路径上修。
+                    #
+                    # Record in _promoted ONLY when the stored status proves the
+                    # tenant is past `creating`. Two of the four CCF causes leave
+                    # status AT `creating` and MUST keep retrying: a `vm_num` gate
+                    # mismatch (this host holds a stale vm.json) and an in-flight
+                    # `dispatch_settle`. An absent Item means the row is gone
+                    # (deleted, or its dispatch reservation was released), which is
+                    # also past `creating`.
+                    #
+                    # ALL_OLD arrives through the resource layer in RAW DynamoDB
+                    # shape ({"S": "running"}), NOT deserialized — verified against a
+                    # live table. Comparing the dict directly is always false, which
+                    # would record every cause including the two above, so the unwrap
+                    # is mandatory, not cosmetic.
+                    #
+                    # The stored item carries secret attributes; it is inspected here
+                    # and never logged.
+                    _old = (getattr(ccf, "response", None) or {}).get("Item") or {}
+                    if (_old.get("status") or {}).get("S") != "creating":
+                        _promoted.add(tid)
                     _refresh_health(table, tid, info, now, metrics, host_port=host_port)
             else:
                 # Not promoted this tick (still creating w/ gateway not up, or a

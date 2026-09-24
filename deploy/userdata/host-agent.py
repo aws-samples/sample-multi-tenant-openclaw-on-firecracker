@@ -1558,8 +1558,12 @@ def _write_host_heartbeat():
 
 
 def _refresh_health(table, tid, info, now, metrics, host_port=None):
-    """Health-refresh write for a tenant NOT promoted this tick (already
-    running, still creating with the gateway not up yet, or down).
+    """Refresh tenant health and return the stored status from the same write.
+
+    A healthy VM is promoted only if this write returns `creating`. Status is
+    checked on every poll: a failed delete can roll `deleting` back to `creating`,
+    so observing a non-creating status is not safe to cache for the process lifetime.
+    ALL_NEW adds no read request; the returned item is inspected, never logged.
 
     `host_port` (#526): pass the value `_ensure_route` just returned so the
     record's advertised port is reconciled to the live bitmap/DNAT truth — same
@@ -1674,10 +1678,12 @@ def _refresh_health(table, tid, info, now, metrics, host_port=None):
         "UpdateExpression": expr,
         "ConditionExpression": "attribute_exists(id) AND host_id = :self",
         "ExpressionAttributeValues": vals,
+        "ReturnValues": "ALL_NEW",
     }
     if names:
         kwargs["ExpressionAttributeNames"] = names
-    table.update_item(**kwargs)
+    result = table.update_item(**kwargs)
+    return result.get("Attributes", {}).get("status")
 
 
 def _write_ddb(results):
@@ -1765,6 +1771,16 @@ def _write_ddb(results):
                     with _lock:
                         _agent_metrics["route_ensure_failures"] += 1
                     continue
+                # Use the existing health write to observe status on EVERY tick.
+                # Running tenants still pay for just one write; a delete rollback
+                # or reused tenant ID cannot leave behind a stale promote memo.
+                # Keep this after route reconciliation so the advertised port is
+                # always the one actually installed on this host.
+                status = _refresh_health(
+                    table, tid, info, now, metrics, host_port=host_port
+                )
+                if status != "creating":
+                    continue
                 # NOTE: `metrics` is a DynamoDB reserved keyword, so it must be
                 # referenced via an ExpressionAttributeNames placeholder (#m).
                 # Same for `status` (#s, already aliased). Without #m the
@@ -1850,17 +1866,10 @@ def _write_ddb(results):
                         f"(host={host_private_ip}:{host_port} guest={info['guest_ip']})"
                     )
                 except table.meta.client.exceptions.ConditionalCheckFailedException:
-                    # promote's `#s = :c AND host_id = :self` lost: tenant is already
-                    # running (normal — just refresh), deleted / migrated away, OR
-                    # 【绝不复活】。回落 guarded refresh(attribute_exists(id) + host_id);
-                    # 已释放租户 host_id 没了 → refresh 的 host_id 守卫也 CCF → 干净 no-op。
-                    #
-                    # #526 —— 这条分支正是【已 running 的租户每 tick 走的路】,而 host_port
-                    # 已由上方 _ensure_route 算出真值。restore 过的租户 DDB 里存的是控制面
-                    # legacy 公式的产物(从未落到 iptables),在此顺带对账回真值:漂移一个 tick
-                    # 内自动收敛,存量错值也一并自愈。promote 那条 `#s = :c` 闸门永远命中不到
-                    # 它们,所以必须在这条回落路径上修。
-                    _refresh_health(table, tid, info, now, metrics, host_port=host_port)
+                    # Health was already refreshed. The status/owner may have
+                    # changed since that write, or vm_num/dispatch_settle may still
+                    # block promotion. Keep every CAS guard and retry next poll.
+                    pass
             else:
                 # Not promoted this tick (still creating w/ gateway not up, or a
                 # health-only refresh for a down VM). Reconcile + guard in the

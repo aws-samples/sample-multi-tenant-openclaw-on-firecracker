@@ -1871,8 +1871,10 @@ def _write_tenant(table, tid, info, now, via="poll"):
 
     # Skipped for down/recovering VMs to keep their last-known metrics
     # rather than overwriting with zeros (which would mask the failure).
+    # Also skipped on the fast path: balloon stats and dumpe2fs can take seconds,
+    # the fast loop writes one tenant at a time, and the next poll fills them in.
     metrics = None
-    if info["vm_health"] == "up":
+    if info["vm_health"] == "up" and via != "fast":
         sock_file = os.path.join(VM_DIR, tid, "fc.sock")
         data_file = os.path.join(VM_DIR, tid, "data.ext4")
         cfg_file = os.path.join(VM_DIR, tid, "vm.json")
@@ -1964,9 +1966,11 @@ def _write_tenant(table, tid, info, now, via="poll"):
                 "SET #s = :r, vm_health = :vh, app_health = :ah, "
                 "health_failures = :z, last_health_check = :t, "
                 "updated_at = :t, host_private_ip = :hpi, host_id = :self, "
-                "host_port = :hp, guest_ip = :gi, #m = :m "
-                "REMOVE capacity_reservation_id"
+                "host_port = :hp, guest_ip = :gi"
             )
+            if via != "fast":
+                update_expr += ", #m = :m"
+            update_expr += " REMOVE capacity_reservation_id"
             # NOTE (loop 2026-07-01): we tried widening this to
             # `#s IN (creating, stopped)` to self-heal a "stopped-but-alive"
             # contradiction, but it RACES fleet-power stop: fleet_power
@@ -1991,8 +1995,11 @@ def _write_tenant(table, tid, info, now, via="poll"):
                 ":hp": int(host_port),
                 ":gi": info["guest_ip"],
                 ":self": INSTANCE_ID,
-                ":m": metrics or {},
             }
+            names = {"#s": "status"}
+            if via != "fast":
+                update_vals[":m"] = metrics or {}
+                names["#m"] = "metrics"
             # 重投【落回同一 host】拿【新】预留(新 vm_num N2,vm_num 单调不复用),此时本机
             # 若残留【旧】vm.json(旧 vm_num N1)会把 N2 的租户按 N1 promote → DDB 放置与实跑
             # VM 的 vm_num 分叉。加 vm_num=:phys 闸:只 promote 【DDB vm_num == 本机 vm.json
@@ -2019,7 +2026,7 @@ def _write_tenant(table, tid, info, now, via="poll"):
                     Key={"id": tid},
                     UpdateExpression=update_expr,
                     ConditionExpression=promote_cond,
-                    ExpressionAttributeNames={"#s": "status", "#m": "metrics"},
+                    ExpressionAttributeNames=names,
                     ExpressionAttributeValues=update_vals,
                 )
                 _observed_status[tid] = "running"
@@ -5249,8 +5256,10 @@ def _poll_loop():
             # don't suppress the host-level liveness signal.
             _write_host_heartbeat()
             _reap_orphan_firecrackers()
+            pass_started = time.monotonic()
             results = _probe_all()
-            _prune_tenant_state(set(os.listdir(VM_DIR)) if os.path.isdir(VM_DIR) else set())
+            present = set(os.listdir(VM_DIR)) if os.path.isdir(VM_DIR) else set()
+            _prune_tenant_state(present)
             ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
             with _lock:
                 previous = dict(_status)
@@ -5258,6 +5267,15 @@ def _poll_loop():
                 for tid, info in results.items():
                     info["updated_at"] = ts
                     _status[tid] = _newer_status(previous.get(tid), info)
+                # A tenant the fast loop published after this pass listed VM_DIR is
+                # not in results; keep it until a pass that saw it replaces it.
+                for tid, info in previous.items():
+                    if (
+                        tid not in results
+                        and tid in present
+                        and info.get("probed_at", 0) > pass_started
+                    ):
+                        _status[tid] = info
             _write_ddb(results)
             _adjust_balloons(results)
             _probe_ssm_agent()  # #387: cached here, never at scrape time

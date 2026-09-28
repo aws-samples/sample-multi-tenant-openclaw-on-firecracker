@@ -512,6 +512,76 @@ def test_rollback_to_creating_is_promoted_on_live_dnat(env, nat):
     assert nat.rules.get(int(item["host_port"])) == "172.16.0.2"
 
 
+def test_fast_write_leaves_metrics_to_the_poll_loop(env):
+    # Balloon stats and dumpe2fs can take seconds each; the fast loop writes one
+    # tenant at a time, so collecting them there held back every other ready tenant.
+    sock = _vm(env)
+    _put(env, metrics={"cpu_pct": 7})  # collected by an earlier poll pass
+    with patch.object(agent, "_compose_metrics", side_effect=AssertionError("slow")):
+        assert _fast({sock: 4242}) == 1
+    item = env.table.get_item(Key={"id": "t-1"})["Item"]
+    assert item["status"] == "running"
+    assert item["metrics"] == {"cpu_pct": 7}  # not blanked by the promote
+    agent._write_ddb({"t-1": {"vm_health": "up", "app_health": "up",
+                              "guest_ip": "172.16.0.2", "phys_vm_num": 1,
+                              "fc_pid": 4242, "probed_at": time.monotonic()}})
+    assert env.table.get_item(Key={"id": "t-1"})["Item"]["metrics"] == {"cpu_pct": 0}
+
+
+def test_poll_promote_still_writes_metrics(env):
+    _put(env)
+    agent._write_ddb({"t-1": {"vm_health": "up", "app_health": "up",
+                              "guest_ip": "172.16.0.2", "phys_vm_num": 1,
+                              "fc_pid": 4242}})
+    item = env.table.get_item(Key={"id": "t-1"})["Item"]
+    assert (item["status"], item["metrics"]) == ("running", {"cpu_pct": 0})
+
+
+class _EndPass(BaseException):
+    pass
+
+
+def _one_poll_pass(probe_all):
+    names = ["_write_host_heartbeat", "_reap_orphan_firecrackers", "_adjust_balloons",
+             "_probe_ssm_agent", "_probe_ssm_buffer_full", "_reconcile_egress"]
+    patches = [patch.object(agent, n) for n in names]
+    patches += [patch.object(agent, "_probe_all", side_effect=probe_all),
+                patch.object(agent, "_agent_loop_tick", side_effect=_EndPass)]
+    for p in patches:
+        p.start()
+    try:
+        with pytest.raises(_EndPass):
+            agent._poll_loop()
+    finally:
+        for p in patches:
+            p.stop()
+
+
+def test_poll_pass_keeps_a_tenant_published_after_its_scan(env):
+    sock = _vm(env)
+    _put(env)
+
+    def probe_all():  # VM_DIR was listed before t-1 appeared...
+        assert _fast({sock: 4242}) == 1  # ...and the fast loop promotes it meanwhile
+        return {}
+
+    _one_poll_pass(probe_all)
+    assert _status(env) == "running"
+    assert agent._status["t-1"]["app_health"] == "up"
+    # A later pass that also misses it (the tenant left) drops it.
+    (env.dir / "t-1" / "vm.json").unlink()
+    (env.dir / "t-1").rmdir()
+    _one_poll_pass(lambda: {})
+    assert "t-1" not in agent._status
+
+
+def test_poll_pass_drops_an_entry_older_than_its_scan(env):
+    agent._status["gone"] = {"app_health": "up", "probed_at": time.monotonic()}
+    (env.dir / "gone").mkdir()
+    _one_poll_pass(lambda: {})  # the pass saw the directory and did not report it
+    assert "gone" not in agent._status
+
+
 # ─── per-tap iptables rules are removed on stop ─────────────────
 
 _SAVE = {

@@ -16,7 +16,7 @@ import subprocess
 import sys
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 import boto3
@@ -49,6 +49,11 @@ FAST_PROMOTE_WINDOW_SEC = int(os.environ.get("OC_AGENT_FAST_PROMOTE_WINDOW_SEC",
 # before trying the same tenant again.
 FAST_PROMOTE_RETRY_SEC = float(os.environ.get("OC_AGENT_FAST_PROMOTE_RETRY_SEC", "5"))
 FAST_PROMOTE_PARALLEL = int(os.environ.get("OC_AGENT_FAST_PROMOTE_PARALLEL", "8"))
+# Gateway check timeout on the fast path. A gateway slower than this is left to the
+# next fast tick or the poll pass instead of holding a probe worker for 8 s.
+FAST_PROMOTE_PROBE_TIMEOUT_SEC = float(
+    os.environ.get("OC_AGENT_FAST_PROMOTE_PROBE_TIMEOUT_SEC", "2")
+)
 # The poll pass reuses one `iptables -t nat -S PREROUTING` listing for this long when
 # the tenant's DNAT rule is already in it. Allocation always re-lists live rules.
 ROUTE_RULES_MAX_AGE_SEC = float(os.environ.get("OC_AGENT_ROUTE_RULES_MAX_AGE_SEC", "5"))
@@ -481,6 +486,10 @@ _observed_status = {}
 _tenant_write_locks = {}
 _tenant_write_locks_guard = threading.Lock()
 _fast_retry_at = {}  # tenant_id -> monotonic time before which the fast loop skips it
+# Monotonic start time of the newest probe written per tenant. The two loops probe
+# independently, so a poll result taken before a fast-promote write can reach the
+# lock after it; _write_tenant drops such an older result instead of writing it.
+_last_probe_at = {}
 
 
 def _tenant_write_lock(tid):
@@ -497,6 +506,7 @@ def _prune_tenant_state(live_tids):
         if tid not in live_tids:
             _observed_status.pop(tid, None)
             _fast_retry_at.pop(tid, None)
+            _last_probe_at.pop(tid, None)
     with _tenant_write_locks_guard:
         for tid in list(_tenant_write_locks):
             if tid not in live_tids and not _tenant_write_locks[tid].locked():
@@ -668,7 +678,9 @@ def _get_redis_writer() -> route_ops.RedisRouteWriter | None:
         return _redis_writer
 
 
-def _ensure_route(tenant_id: str, guest_ip: str) -> tuple[str, int | None]:
+def _ensure_route(
+    tenant_id: str, guest_ip: str, max_age: float = 0.0
+) -> tuple[str, int | None]:
     """Contract §3: allocate a host port + write PREROUTING DNAT for this
     tenant, then §1: write `route:{tenant_id}` to Redis. Idempotent per
     tenant: if the DDB descriptor already carries a host_port and the
@@ -680,12 +692,14 @@ def _ensure_route(tenant_id: str, guest_ip: str) -> tuple[str, int | None]:
 
     Redis write failure does NOT propagate: contract §6 HA — DDB is
     authoritative and route.lua fail-static handles the transient gap.
+
+    max_age > 0 may answer from a DNAT listing that old, which another process
+    (route_ops CLI over SSM) could have changed since. Only refreshes of tenants
+    already running pass it; a promote always checks the live rules.
     """
     host_ip = _get_host_private_ip()
     bitmap = _get_port_bitmap()
-    port = route_ops.ensure_port_and_dnat(
-        bitmap, guest_ip, max_age=ROUTE_RULES_MAX_AGE_SEC
-    )
+    port = route_ops.ensure_port_and_dnat(bitmap, guest_ip, max_age=max_age)
     writer = _get_redis_writer()
     if writer is not None and host_ip:
         writer.set_route(tenant_id, host_ip, port, guest_ip)
@@ -1089,7 +1103,7 @@ def _mounted_image_snapshots(fc_pid, proc_root="/proc"):
     return evidence
 
 
-def _probe_app_health(guest_ip, chat_ep):
+def _probe_app_health(guest_ip, chat_ep, timeout=8):
     """探 guest gateway 的 app_health,返回 "up"/"down"。
 
     #526 — 对开了 chatCompletions 的租户(chat_ep 为真)收紧判据:探真实数据面入口
@@ -1109,7 +1123,7 @@ def _probe_app_health(guest_ip, chat_ep):
                            f"http://{guest_ip}:{GATEWAY_PORT}/v1/chat/completions"]
         else:
             args = base + [f"http://{guest_ip}:{GATEWAY_PORT}/"]
-        r = subprocess.run(args, capture_output=True, timeout=8)
+        r = subprocess.run(args, capture_output=True, timeout=timeout)
         code = (r.stdout or b"").decode(errors="replace").strip()
         if r.returncode != 0 or not code.isdigit() or code == "000":
             return "down"  # 端口不通/无 HTTP 应答
@@ -1172,8 +1186,13 @@ def _fc_pid(sock_file, index):
     return None
 
 
-def _probed_result(fc_pid, guest_ip, phys_vm_num, observed_image, vm_health, app_health):
-    """Probe result of a VM whose Firecracker is running (poll and fast-promote loops)."""
+def _probed_result(
+    fc_pid, guest_ip, phys_vm_num, observed_image, vm_health, app_health, probed_at
+):
+    """Probe result of a VM whose Firecracker is running (poll and fast-promote loops).
+
+    probed_at is the monotonic time the probe started; see _last_probe_at.
+    """
     mounted_evidence = (
         _mounted_image_snapshots(fc_pid) if vm_health == "up" else {}
     )
@@ -1183,6 +1202,7 @@ def _probed_result(fc_pid, guest_ip, phys_vm_num, observed_image, vm_health, app
         "guest_ip": guest_ip,
         "fc_pid": fc_pid,
         "phys_vm_num": phys_vm_num,
+        "probed_at": probed_at,
         # 只在【VM 真的起来了】时才上报版本(vm_health=="up" 即 guest ping 通),并连
         # FC 进程的启动时刻一起上报。
         #
@@ -1222,6 +1242,7 @@ def _probe_all():
     pid_index = _fc_pid_index()
 
     for tenant_id in entries:
+        probed_at = time.monotonic()
         vm_path = os.path.join(VM_DIR, tenant_id)
         cfg_file = os.path.join(vm_path, "vm.json")
         if not os.path.isfile(cfg_file):
@@ -1274,6 +1295,7 @@ def _probe_all():
                 "app_health": "down",
                 "guest_ip": guest_ip,
                 "phys_vm_num": phys_vm_num,
+                "probed_at": probed_at,
                 # 不带 observed_image_snapshot_time:此刻 Firecracker 并未在跑(或 guest
                 # 不可达正在重建网络),vm.json 里的版本只是"上次启动打算用哪个版本",
                 # 不构成"这台 VM 现在真的跑着该版本"的证据。上报它会让控制面把一次
@@ -1311,6 +1333,7 @@ def _probe_all():
                 "app_health": "down",
                 "guest_ip": guest_ip,
                 "phys_vm_num": phys_vm_num,
+                "probed_at": probed_at,
                 # 不带 observed_image_snapshot_time:此刻 Firecracker 并未在跑(或 guest
                 # 不可达正在重建网络),vm.json 里的版本只是"上次启动打算用哪个版本",
                 # 不构成"这台 VM 现在真的跑着该版本"的证据。上报它会让控制面把一次
@@ -1319,7 +1342,8 @@ def _probe_all():
             continue
 
         results[tenant_id] = _probed_result(
-            fc_pid, guest_ip, phys_vm_num, observed_image, vm_health, app_health
+            fc_pid, guest_ip, phys_vm_num, observed_image, vm_health, app_health,
+            probed_at,
         )
 
     return results
@@ -1797,12 +1821,36 @@ def _write_ddb(results):
             _write_tenant(table, tid, info, now)
 
 
+def _write_route(tid, info, max_age):
+    """_ensure_route for _write_tenant: (host_ip, port), or None to skip this tick."""
+    try:
+        host_private_ip, host_port = _ensure_route(tid, info["guest_ip"], max_age)
+    except Exception as e:
+        print(f"ensure_route {tid} failed (skip promote this tick): {e}")
+        # tenant stuck at creating; counting only one under-reports.
+        with _lock:
+            _agent_metrics["route_ensure_failures"] += 1
+        return None
+    if not host_private_ip or host_port is None:
+        print(f"ensure_route {tid} degraded (host_ip or port missing)")
+        with _lock:
+            _agent_metrics["route_ensure_failures"] += 1
+        return None
+    return host_private_ip, host_port
+
+
 def _write_tenant(table, tid, info, now, via="poll"):
     """Route + health write for one tenant, then promote it if it is still creating.
 
     Caller holds _tenant_write_lock(tid). Records the status the health write
-    observed in _observed_status for the fast-promote loop.
+    observed in _observed_status for the fast-promote loop. A result whose probe
+    started before the last one written for this tenant is dropped.
     """
+    probed_at = info.get("probed_at")
+    if probed_at is not None:
+        if probed_at < _last_probe_at.get(tid, probed_at):
+            return
+        _last_probe_at[tid] = probed_at
     # 撞号检查(create + migrate)对它们会退回 vm_num,迁移过的会有短暂盲区。这里用 vm.json
     # 里的物理 vm_num 补齐,if_not_exists 保证只写一次、绝不覆盖(create 已写的、或先前
     # 回填的都不动)——迁移把 vm_num 翻成 target 槽时 phys_vm_num 恒定,靠的正是"绝不覆盖"。
@@ -1868,19 +1916,15 @@ def _write_tenant(table, tid, info, now, via="poll"):
             # tick — the next probe will retry. gateway_token is P1's
             # concern (control-plane pre-mints ciphertext into DDB at
             # create); host-agent no longer SSH-reads it (§4).
-            try:
-                host_private_ip, host_port = _ensure_route(tid, info["guest_ip"])
-            except Exception as e:
-                print(f"ensure_route {tid} failed (skip promote this tick): {e}")
-                # tenant stuck at creating; counting only one under-reports.
-                with _lock:
-                    _agent_metrics["route_ensure_failures"] += 1
+            # A tenant last seen running may answer from the poll pass's cached DNAT
+            # listing; anything that may be promoted checks the live rules.
+            cached_ok = _observed_status.get(tid) == "running"
+            route = _write_route(
+                tid, info, ROUTE_RULES_MAX_AGE_SEC if cached_ok else 0.0
+            )
+            if route is None:
                 return
-            if not host_private_ip or host_port is None:
-                print(f"ensure_route {tid} degraded (host_ip or port missing)")
-                with _lock:
-                    _agent_metrics["route_ensure_failures"] += 1
-                return
+            host_private_ip, host_port = route
             # Use the existing health write to observe status on EVERY tick.
             # Running tenants still pay for just one write; a delete rollback
             # or reused tenant ID cannot leave behind a stale promote memo.
@@ -1892,6 +1936,12 @@ def _write_tenant(table, tid, info, now, via="poll"):
             _observed_status[tid] = status
             if status != "creating":
                 return
+            if cached_ok:
+                # Rolled back to creating while we still thought it was running.
+                route = _write_route(tid, info, 0.0)
+                if route is None:
+                    return
+                host_private_ip, host_port = route
             # NOTE: `metrics` is a DynamoDB reserved keyword, so it must be
             # referenced via an ExpressionAttributeNames placeholder (#m).
             # Same for `status` (#s, already aliased). Without #m the
@@ -5072,6 +5122,7 @@ def _fast_probe(tid, pid_index):
 
     Read-only: recovery, relaunch and net-dead counting stay with the poll loop.
     """
+    probed_at = time.monotonic()
     vm_path = os.path.join(VM_DIR, tid)
     try:
         with open(os.path.join(vm_path, "vm.json"), encoding="utf-8") as f:
@@ -5090,7 +5141,10 @@ def _fast_probe(tid, pid_index):
         return None
     if r.returncode != 0:
         return None
-    if _probe_app_health(guest_ip, cfg.get("chat_ep", 0)) != "up":
+    app_health = _probe_app_health(
+        guest_ip, cfg.get("chat_ep", 0), timeout=FAST_PROMOTE_PROBE_TIMEOUT_SEC
+    )
+    if app_health != "up":
         return None
     return _probed_result(
         fc_pid,
@@ -5099,53 +5153,93 @@ def _fast_probe(tid, pid_index):
         cfg.get("image_snapshot_time") or "",
         "up",
         "up",
+        probed_at,
     )
 
 
-def _fast_promote_once():
-    """Promote every candidate whose gateway answers now. Returns how many were written."""
-    if not TENANTS_TABLE:
-        return 0
-    candidates = _fast_promote_candidates(time.time())
+def _newer_status(current, info):
+    """The /metrics snapshot entry to keep: whichever probe started later."""
+    if current is None:
+        return info
+    old_at = current.get("probed_at")
+    new_at = info.get("probed_at")
+    if old_at is not None and new_at is not None and old_at > new_at:
+        return current
+    return info
+
+
+def _fast_promote_submit(pool, inflight):
+    """Start a probe for every candidate that has none running. Returns how many."""
+    busy = set(inflight.values())
+    candidates = [t for t in _fast_promote_candidates(time.time()) if t not in busy]
     if not candidates:
         return 0
     pid_index = _fc_pid_index()
     if pid_index is None:
         return 0
-    with ThreadPoolExecutor(max_workers=max(1, FAST_PROMOTE_PARALLEL)) as ex:
-        probed = list(ex.map(lambda t: (t, _fast_probe(t, pid_index)), candidates))
-    ready = [(tid, info) for tid, info in probed if info is not None]
-    if not ready:
-        return 0
-    table = _get_ddb().Table(TENANTS_TABLE)
+    for tid in candidates:
+        inflight[pool.submit(_fast_probe, tid, pid_index)] = tid
+    return len(candidates)
+
+
+def _fast_promote_write(tid, info):
+    """Promote one ready tenant unless the poll loop is writing it. True if written."""
+    lk = _tenant_write_lock(tid)
+    if not lk.acquire(blocking=False):
+        return False  # the poll loop is writing this tenant right now
     now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    try:
+        _write_tenant(_get_ddb().Table(TENANTS_TABLE), tid, info, now, via="fast")
+    finally:
+        lk.release()
+    if _observed_status.get(tid, "creating") == "creating":
+        # Healthy but not promoted: a CAS guard (vm_num, dispatch_settle) or a
+        # route failure is still blocking. Do not rewrite it every second.
+        _fast_retry_at[tid] = time.monotonic() + FAST_PROMOTE_RETRY_SEC
+    with _lock:
+        _status[tid] = _newer_status(_status.get(tid), {**info, "updated_at": now})
+    return True
+
+
+def _fast_promote_drain(inflight, timeout):
+    """Write each probe that finishes within timeout, as it finishes. Returns how many."""
+    if not inflight:
+        return 0
+    done, _ = wait(list(inflight), timeout=timeout, return_when=FIRST_COMPLETED)
     written = 0
-    for tid, info in ready:
-        lk = _tenant_write_lock(tid)
-        if not lk.acquire(blocking=False):
-            continue  # the poll loop is writing this tenant right now
+    for fut in done:
+        tid = inflight.pop(fut)
         try:
-            _write_tenant(table, tid, info, now, via="fast")
-        finally:
-            lk.release()
-        written += 1
-        if _observed_status.get(tid, "creating") == "creating":
-            # Healthy but not promoted: a CAS guard (vm_num, dispatch_settle) or a
-            # route failure is still blocking. Do not rewrite it every second.
-            _fast_retry_at[tid] = time.monotonic() + FAST_PROMOTE_RETRY_SEC
-        with _lock:
-            _status[tid] = {**info, "updated_at": now}
+            info = fut.result()
+        except Exception as e:
+            print(f"fast probe {tid}: {e}")
+            continue
+        if info is not None and _fast_promote_write(tid, info):
+            written += 1
     return written
 
 
 def _fast_promote_loop():
-    while True:
-        try:
-            _fast_promote_once()
-        except Exception as e:
-            print(f"fast promote error: {e}")
-        _agent_loop_tick("fast_promote")
-        time.sleep(FAST_PROMOTE_INTERVAL)
+    # Probes run on the pool and are written by this thread in completion order,
+    # so one slow gateway never holds back a tenant that is already ready, and a
+    # tenant with a probe still running is not probed again.
+    inflight = {}  # future -> tenant_id
+    next_scan = 0.0
+    with ThreadPoolExecutor(max_workers=max(1, FAST_PROMOTE_PARALLEL)) as pool:
+        while True:
+            try:
+                if time.monotonic() >= next_scan:
+                    next_scan = time.monotonic() + FAST_PROMOTE_INTERVAL
+                    _fast_promote_submit(pool, inflight)
+                    _agent_loop_tick("fast_promote")
+                remaining = max(0.0, next_scan - time.monotonic())
+                if inflight:
+                    _fast_promote_drain(inflight, remaining)
+                else:
+                    time.sleep(remaining)
+            except Exception as e:
+                print(f"fast promote error: {e}")
+                time.sleep(FAST_PROMOTE_INTERVAL)
 
 
 def _poll_loop():
@@ -5159,10 +5253,11 @@ def _poll_loop():
             _prune_tenant_state(set(os.listdir(VM_DIR)) if os.path.isdir(VM_DIR) else set())
             ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
             with _lock:
+                previous = dict(_status)
                 _status.clear()
                 for tid, info in results.items():
                     info["updated_at"] = ts
-                    _status[tid] = info
+                    _status[tid] = _newer_status(previous.get(tid), info)
             _write_ddb(results)
             _adjust_balloons(results)
             _probe_ssm_agent()  # #387: cached here, never at scrape time

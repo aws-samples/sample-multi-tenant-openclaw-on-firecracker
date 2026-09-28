@@ -14,7 +14,9 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -104,6 +106,7 @@ def test_probe_all_scans_the_process_table_once(tmp_path):
     assert calls.count("pgrep") == 1
     assert calls.count("ping") == 5
     assert {r["fc_pid"] for r in results.values()} == {100, 101, 102, 103, 104}
+    assert all(isinstance(r["probed_at"], float) for r in results.values())
     assert all(r["vm_health"] == "up" for r in results.values())
 
 
@@ -121,7 +124,8 @@ def env(tmp_path):
             BillingMode="PAY_PER_REQUEST",
         )
         for state in (agent._observed_status, agent._fast_retry_at,
-                      agent._tenant_write_locks, agent._phys_backfilled):
+                      agent._tenant_write_locks, agent._phys_backfilled,
+                      agent._last_probe_at, agent._status):
             state.clear()
         agent._phys_backfilled.add("t-1")
         with (
@@ -182,9 +186,15 @@ def _host(pids, gateway="up", ping_rc=0):
 
 
 def _fast(pids, **kw):
+    """One fast-promote tick: probe every candidate and write each result."""
     run, app = _host(pids, **kw)
-    with run, app:
-        return agent._fast_promote_once()
+    with run, app, ThreadPoolExecutor(max_workers=4) as pool:
+        inflight = {}
+        agent._fast_promote_submit(pool, inflight)
+        written = 0
+        while inflight:
+            written += agent._fast_promote_drain(inflight, 5)
+        return written
 
 
 def test_fast_path_promotes_as_soon_as_gateway_answers(env, capsys):
@@ -311,12 +321,14 @@ def test_poll_pass_reopens_a_rolled_back_tenant_to_the_fast_path(env):
 def test_prune_forgets_tenants_that_left_the_host():
     agent._observed_status.update({"gone": "running", "here": "creating"})
     agent._fast_retry_at["gone"] = 1
+    agent._last_probe_at["gone"] = 1.0
     agent._tenant_write_lock("gone")
     held = agent._tenant_write_lock("held")
     with held:
         agent._prune_tenant_state({"here"})
     assert "gone" not in agent._observed_status
     assert "gone" not in agent._fast_retry_at
+    assert "gone" not in agent._last_probe_at
     assert "gone" not in agent._tenant_write_locks
     assert agent._tenant_write_locks.get("held") is held  # never drop a held lock
     assert agent._observed_status["here"] == "creating"
@@ -377,6 +389,127 @@ def test_expired_or_released_listing_is_not_reused(nat):
     port = route_ops.ensure_port_and_dnat(nat.bitmap, "172.16.0.2", max_age=60)
     assert len(nat.lists) == 3
     assert nat.rules == {port: "172.16.0.2"}
+
+
+def test_ready_tenant_is_written_while_another_probe_is_still_running(env):
+    _vm(env)
+    _vm(env, tid="slow")
+    _put(env)
+    ready = {"vm_health": "up", "app_health": "up", "guest_ip": "172.16.0.2",
+             "phys_vm_num": 1, "fc_pid": 4242, "probed_at": time.monotonic()}
+    release = threading.Event()
+
+    def probe(tid, index):
+        if tid == "slow":
+            release.wait(5)
+            return None
+        return ready
+
+    inflight = {}
+    with (
+        patch.object(agent, "_fc_pid_index", return_value={}),
+        patch.object(agent, "_fast_probe", side_effect=probe),
+        ThreadPoolExecutor(max_workers=2) as pool,
+    ):
+        try:
+            assert agent._fast_promote_submit(pool, inflight) == 2
+            deadline = time.monotonic() + 3
+            while _status(env) != "running" and time.monotonic() < deadline:
+                agent._fast_promote_drain(inflight, 0.2)
+            assert _status(env) == "running"
+            assert list(inflight.values()) == ["slow"]  # still probing
+            # The next tick does not start a second probe of the slow tenant.
+            assert agent._fast_promote_submit(pool, inflight) == 0
+        finally:
+            release.set()
+        while inflight:
+            agent._fast_promote_drain(inflight, 5)
+
+
+def test_fast_probe_bounds_the_gateway_check(env):
+    sock = _vm(env)
+    seen = {}
+
+    def app(ip, chat_ep, timeout=8):
+        seen["timeout"] = timeout
+        return "down"
+
+    with (
+        patch.object(agent, "_probe_app_health", side_effect=app),
+        patch.object(agent.subprocess, "run", return_value=_proc("", 0)),
+    ):
+        assert agent._fast_probe("t-1", {sock: 1}) is None
+    assert seen["timeout"] == agent.FAST_PROMOTE_PROBE_TIMEOUT_SEC < 8
+
+
+def test_poll_result_probed_before_a_fast_write_is_dropped(env):
+    sock = _vm(env)
+    _put(env)
+    before = time.monotonic()  # the poll pass probes t-1 (gateway still down)...
+    old = {"vm_health": "up", "app_health": "down", "guest_ip": "172.16.0.2",
+           "phys_vm_num": 1, "fc_pid": 4242, "probed_at": before}
+    assert _fast({sock: 4242}) == 1  # ...the fast loop promotes it meanwhile...
+    env.writes.reset_mock()
+    agent._write_ddb({"t-1": old})  # ...then the poll pass reaches the lock
+    env.writes.assert_not_called()
+    item = env.table.get_item(Key={"id": "t-1"})["Item"]
+    assert (item["status"], item["app_health"]) == ("running", "up")
+    # A probe that started after the fast write is written as usual.
+    agent._write_ddb({"t-1": {**old, "probed_at": time.monotonic()}})
+    assert env.table.get_item(Key={"id": "t-1"})["Item"]["app_health"] == "down"
+
+
+def test_metrics_snapshot_keeps_the_newer_probe():
+    fast = {"app_health": "up", "probed_at": 2.0}
+    assert agent._newer_status(fast, {"app_health": "down", "probed_at": 1.0}) is fast
+    newer = {"app_health": "down", "probed_at": 3.0}
+    assert agent._newer_status(fast, newer) is newer
+    legacy = {"app_health": "down"}
+    assert agent._newer_status(fast, legacy) is legacy
+    assert agent._newer_status(None, legacy) is legacy
+
+
+def _real_route(nat):
+    def ensure(tid, guest_ip, max_age=0.0):
+        return "10.0.0.1", route_ops.ensure_port_and_dnat(nat.bitmap, guest_ip, max_age=max_age)
+    return patch.object(agent, "_ensure_route", side_effect=ensure)
+
+
+def test_promote_checks_live_dnat_even_when_the_listing_is_cached(env, nat):
+    sock = _vm(env)
+    _put(env)
+    route_ops.ensure_port_and_dnat(nat.bitmap, "172.16.0.2", max_age=60)  # warm cache
+    nat.rules.clear()  # another process (route_ops CLI over SSM) removed the DNAT
+    with _real_route(nat):
+        assert _fast({sock: 4242}) == 1
+    item = env.table.get_item(Key={"id": "t-1"})["Item"]
+    assert item["status"] == "running"
+    assert nat.rules.get(int(item["host_port"])) == "172.16.0.2"
+
+
+def test_only_running_tenants_refresh_from_the_cached_listing(env, nat):
+    _put(env, status="running")
+    agent._observed_status["t-1"] = "running"
+    info = {"vm_health": "up", "app_health": "up", "guest_ip": "172.16.0.2",
+            "phys_vm_num": 1, "fc_pid": 1}
+    with _real_route(nat):
+        for _ in range(3):
+            agent._write_ddb({"t-1": dict(info)})
+    assert len(nat.lists) == 1
+
+
+def test_rollback_to_creating_is_promoted_on_live_dnat(env, nat):
+    _put(env)  # a delete rolled back to creating
+    agent._observed_status["t-1"] = "running"  # ...since our last write saw running
+    route_ops.ensure_port_and_dnat(nat.bitmap, "172.16.0.2", max_age=60)
+    nat.rules.clear()
+    with _real_route(nat):
+        agent._write_ddb({"t-1": {"vm_health": "up", "app_health": "up",
+                                  "guest_ip": "172.16.0.2", "phys_vm_num": 1,
+                                  "fc_pid": 1}})
+    item = env.table.get_item(Key={"id": "t-1"})["Item"]
+    assert item["status"] == "running"
+    assert nat.rules.get(int(item["host_port"])) == "172.16.0.2"
 
 
 # ─── per-tap iptables rules are removed on stop ─────────────────

@@ -66,6 +66,36 @@ publish_stop_intent() {
   STOP_INTENT_PUBLISHED=1
 }
 
+# Remove every filter/nat rule that matches `-i <tap>`: the IMDS / tenant-supernet /
+# Redis / management-port DROPs, the FORWARD ACCEPT, and the egress-allowlist DNS
+# DNAT that launch-vm.sh (and migrate-vm.sh) install per tap. Nothing used to delete
+# them, and vm_num never repeats on a host, so the rule set grew with the host's
+# history: ~13 rules per tap ever launched, which made every later launch slower.
+# Every launch path re-adds them before Firecracker starts, and this runs under
+# the per-tenant lifecycle lock, so the tenant's own launch cannot interleave. The
+# gateway DNAT (`--dport <host_port>`, no -i) is left alone: stop keeps the route.
+purge_tap_rules() {
+  local tap="$1" table rules
+  for table in filter nat; do
+    rules="$(sudo iptables-save -t "${table}" 2>/dev/null |
+      grep -E -- "^-A .* -i ${tap}( |$)" | sed 's/^-A /-D /')" || true
+    [ -n "${rules}" ] || continue
+    if ! printf '*%s\n%s\nCOMMIT\n' "${table}" "${rules}" |
+      sudo iptables-restore --noflush 2>/dev/null; then
+      # One batch is atomic; if it failed, delete what is still there one by one.
+      while IFS= read -r rule; do
+        # shellcheck disable=SC2086  # iptables-save output is already tokenized
+        sudo iptables -w 5 -t "${table}" ${rule} 2>/dev/null || true
+      done <<< "${rules}"
+    fi
+  done
+  local left
+  left="$(sudo iptables-save 2>/dev/null | grep -cE -- " -i ${tap}( |$)")" || true
+  if [ "${left:-0}" -gt 0 ]; then
+    log "WARN: ${left} iptables rules for ${tap} survived cleanup"
+  fi
+}
+
 # ⑰ codex 独立复审第十轮 —— 判"这个进程是不是 Firecracker"必须用 /proc/<pid>/comm,
 # 不能用 exe 的 basename。
 #
@@ -368,6 +398,7 @@ if [ "${LEGACY_FIRECRACKER_TERMINATED}" -eq 0 ]; then
 fi
 # 4) Clean up the host-side network + sockets + nginx route.
 sudo ip link del "tap-vm${VM_NUM}" 2>/dev/null || true
+purge_tap_rules "tap-vm${VM_NUM}"
 rm -f "${VM_DIR}/fc.sock" "${VM_DIR}/fc.log"
 sudo rm -f "/etc/nginx/conf.d/tenants/${TENANT_ID}.conf"
 sudo nginx -s reload 2>/dev/null || true

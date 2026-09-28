@@ -16,6 +16,7 @@ import subprocess
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 import boto3
@@ -36,6 +37,21 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import route_ops  # noqa: E402
 
 POLL_INTERVAL = int(os.environ.get("OC_AGENT_POLL_INTERVAL", "15"))
+# A creating tenant used to wait for the next full poll pass to be promoted, and a
+# pass grows with the number of VMs on the host (~25 s at 290 VMs, measured on
+# r8g.metal-24xl). The fast-promote loop probes only recently launched creating VMs
+# and promotes them as soon as the gateway answers. 0 disables it.
+FAST_PROMOTE_INTERVAL = float(os.environ.get("OC_AGENT_FAST_PROMOTE_INTERVAL", "1"))
+# Only VMs whose vm.json was written this recently are candidates, so a tenant stuck
+# in creating falls back to the poll loop instead of being probed every second forever.
+FAST_PROMOTE_WINDOW_SEC = int(os.environ.get("OC_AGENT_FAST_PROMOTE_WINDOW_SEC", "900"))
+# After an attempt that did not promote (CAS guard still blocking), wait this long
+# before trying the same tenant again.
+FAST_PROMOTE_RETRY_SEC = float(os.environ.get("OC_AGENT_FAST_PROMOTE_RETRY_SEC", "5"))
+FAST_PROMOTE_PARALLEL = int(os.environ.get("OC_AGENT_FAST_PROMOTE_PARALLEL", "8"))
+# The poll pass reuses one `iptables -t nat -S PREROUTING` listing for this long when
+# the tenant's DNAT rule is already in it. Allocation always re-lists live rules.
+ROUTE_RULES_MAX_AGE_SEC = float(os.environ.get("OC_AGENT_ROUTE_RULES_MAX_AGE_SEC", "5"))
 PORT = int(os.environ.get("OC_AGENT_PORT", "8899"))
 # Health/control AND Prometheus /metrics are served by the SAME HTTPServer
 # on PORT (8899). The earlier OC_AGENT_PROM_PORT=9090 split-port design was
@@ -454,6 +470,38 @@ _CRED_FAILURE_EXIT_THRESHOLD = int(os.environ.get("AGENT_CRED_FAIL_EXIT_THRESHOL
 _status = {}
 _lock = threading.Lock()
 
+# Status returned by the latest health write per tenant (poll or fast-promote loop).
+# The fast-promote loop only considers tenants whose last observed status is creating
+# or unknown; the poll loop refreshes it on every pass, so a rollback to creating is
+# picked up within one pass.
+_observed_status = {}
+# Serializes the route + health + promote write of one tenant between the poll loop
+# and the fast-promote loop, so the two never run _ensure_route for the same tenant
+# at the same time.
+_tenant_write_locks = {}
+_tenant_write_locks_guard = threading.Lock()
+_fast_retry_at = {}  # tenant_id -> monotonic time before which the fast loop skips it
+
+
+def _tenant_write_lock(tid):
+    with _tenant_write_locks_guard:
+        lk = _tenant_write_locks.get(tid)
+        if lk is None:
+            lk = _tenant_write_locks[tid] = threading.Lock()
+        return lk
+
+
+def _prune_tenant_state(live_tids):
+    """Forget per-tenant fast-path state for tenants no longer on this host."""
+    for tid in list(_observed_status):
+        if tid not in live_tids:
+            _observed_status.pop(tid, None)
+            _fast_retry_at.pop(tid, None)
+    with _tenant_write_locks_guard:
+        for tid in list(_tenant_write_locks):
+            if tid not in live_tids and not _tenant_write_locks[tid].locked():
+                del _tenant_write_locks[tid]
+
 # Balloon controller counters, reset each _adjust_balloons cycle. Exposed on
 # /metrics so a silently inert controller is visible instead of invisible
 # (the failure mode this issue was filed for).
@@ -635,7 +683,9 @@ def _ensure_route(tenant_id: str, guest_ip: str) -> tuple[str, int | None]:
     """
     host_ip = _get_host_private_ip()
     bitmap = _get_port_bitmap()
-    port = route_ops.ensure_port_and_dnat(bitmap, guest_ip)
+    port = route_ops.ensure_port_and_dnat(
+        bitmap, guest_ip, max_age=ROUTE_RULES_MAX_AGE_SEC
+    )
     writer = _get_redis_writer()
     if writer is not None and host_ip:
         writer.set_route(tenant_id, host_ip, port, guest_ip)
@@ -1070,6 +1120,98 @@ def _probe_app_health(guest_ip, chat_ep):
         return "down"
 
 
+def _fc_pid_index():
+    """Scan the process table once: {api-sock path: lowest pid}, or None on failure.
+
+    `pgrep -f` reads every /proc/<pid>/cmdline, ~40 ms on a 290-VM host, and the
+    poll pass used to run it once per VM (~11 s of a ~25 s pass). The lowest pid
+    matches what the per-VM `pgrep -f "api-sock <sock>"` returned first.
+    """
+    try:
+        r = subprocess.run(
+            ["pgrep", "-af", "api-sock"], capture_output=True, text=True, timeout=10
+        )
+    except Exception:
+        return None
+    if r.returncode not in (0, 1):  # 1 = no process matched, a valid empty answer
+        return None
+    index = {}
+    for line in r.stdout.splitlines():
+        toks = line.split()
+        try:
+            pid = int(toks[0])
+        except (ValueError, IndexError):
+            continue
+        for i, tok in enumerate(toks[1:-1], start=1):
+            if tok.endswith("api-sock"):
+                sock = toks[i + 1]
+                if sock not in index or pid < index[sock]:
+                    index[sock] = pid
+    return index
+
+
+def _fc_pid(sock_file, index):
+    """Firecracker pid for one VM from the pass snapshot.
+
+    A VM missing from the snapshot is re-checked with its own pgrep before the
+    caller treats it as dead: the snapshot predates the pass, and a VM launched
+    since then must not be sent to _recover_vm.
+    """
+    if index is not None and sock_file in index:
+        return index[sock_file]
+    pgrep = subprocess.run(
+        ["pgrep", "-f", f"api-sock {sock_file}"], capture_output=True, text=True
+    )
+    if pgrep.returncode == 0:
+        pids = pgrep.stdout.strip().split()
+        if pids:
+            try:
+                return int(pids[0])
+            except (ValueError, IndexError):
+                pass
+    return None
+
+
+def _probed_result(fc_pid, guest_ip, phys_vm_num, observed_image, vm_health, app_health):
+    """Probe result of a VM whose Firecracker is running (poll and fast-promote loops)."""
+    mounted_evidence = (
+        _mounted_image_snapshots(fc_pid) if vm_health == "up" else {}
+    )
+    return {
+        "vm_health": vm_health,
+        "app_health": app_health,
+        "guest_ip": guest_ip,
+        "fc_pid": fc_pid,
+        "phys_vm_num": phys_vm_num,
+        # 只在【VM 真的起来了】时才上报版本(vm_health=="up" 即 guest ping 通),并连
+        # FC 进程的启动时刻一起上报。
+        #
+        # 为什么两者都必须有:launch-vm.sh 在起 firecracker 之前 800+ 行就把版本写进了
+        # vm.json(建盘/mkfs/解压/拉备份都在那之后),所以「vm.json 里有目标版本」只
+        # 证明启动流程走到了那一行。两种假成功由此而来:
+        #   ① 中途失败 → 版本==目标但 VM 根本没起(ping 不通挡掉);
+        #   ② 旧 FC 没被 stop-vm 杀掉 → VM ping 得通、vm.json 已改成新版本,但跑的还是
+        #      【旧】rootfs(ping 挡不住,只能靠进程启动时刻:它早于本次 rebuild 发起
+        #      时刻,说明这不是本次起来的进程)。
+        # 控制面据此把判据从「版本相符」升格为「版本相符 且 进程是本次 rebuild 之后
+        # 新起的」。缺失该时刻(读不到 /proc)时控制面不得单凭版本判 done。
+        **(
+            {
+                "observed_image_snapshot_time": observed_image,
+                "observed_boot_at": _fc_boot_iso(fc_pid),
+                "observed_mounted_rootfs_snapshot_time": (
+                    mounted_evidence.get("rootfs", "")
+                ),
+                "observed_mounted_immutable_snapshot_time": (
+                    mounted_evidence.get("immutable", "")
+                ),
+            }
+            if vm_health == "up"
+            else {}
+        ),
+    }
+
+
 def _probe_all():
     """Probe all local VMs."""
     results = {}
@@ -1077,6 +1219,7 @@ def _probe_all():
         entries = os.listdir(VM_DIR)
     except FileNotFoundError:
         return results
+    pid_index = _fc_pid_index()
 
     for tenant_id in entries:
         vm_path = os.path.join(VM_DIR, tenant_id)
@@ -1121,17 +1264,7 @@ def _probe_all():
         # Capture pid here too so the metrics composer can read /proc/<pid>
         # without re-running pgrep on every gauge.
         sock_file = os.path.join(vm_path, "fc.sock")
-        pgrep = subprocess.run(
-            ["pgrep", "-f", f"api-sock {sock_file}"], capture_output=True, text=True
-        )
-        fc_pid = None
-        if pgrep.returncode == 0:
-            pids = pgrep.stdout.strip().split()
-            if pids:
-                try:
-                    fc_pid = int(pids[0])
-                except (ValueError, IndexError):
-                    pass
+        fc_pid = _fc_pid(sock_file, pid_index)
         fc_running = fc_pid is not None
 
         if not fc_running:
@@ -1185,42 +1318,9 @@ def _probe_all():
             }
             continue
 
-        mounted_evidence = (
-            _mounted_image_snapshots(fc_pid) if vm_health == "up" else {}
+        results[tenant_id] = _probed_result(
+            fc_pid, guest_ip, phys_vm_num, observed_image, vm_health, app_health
         )
-        results[tenant_id] = {
-            "vm_health": vm_health,
-            "app_health": app_health,
-            "guest_ip": guest_ip,
-            "fc_pid": fc_pid,
-            "phys_vm_num": phys_vm_num,
-            # 只在【VM 真的起来了】时才上报版本(vm_health=="up" 即 guest ping 通),并连
-            # FC 进程的启动时刻一起上报。
-            #
-            # 为什么两者都必须有:launch-vm.sh 在起 firecracker 之前 800+ 行就把版本写进了
-            # vm.json(建盘/mkfs/解压/拉备份都在那之后),所以「vm.json 里有目标版本」只
-            # 证明启动流程走到了那一行。两种假成功由此而来:
-            #   ① 中途失败 → 版本==目标但 VM 根本没起(ping 不通挡掉);
-            #   ② 旧 FC 没被 stop-vm 杀掉 → VM ping 得通、vm.json 已改成新版本,但跑的还是
-            #      【旧】rootfs(ping 挡不住,只能靠进程启动时刻:它早于本次 rebuild 发起
-            #      时刻,说明这不是本次起来的进程)。
-            # 控制面据此把判据从「版本相符」升格为「版本相符 且 进程是本次 rebuild 之后
-            # 新起的」。缺失该时刻(读不到 /proc)时控制面不得单凭版本判 done。
-            **(
-                {
-                    "observed_image_snapshot_time": observed_image,
-                    "observed_boot_at": _fc_boot_iso(fc_pid),
-                    "observed_mounted_rootfs_snapshot_time": (
-                        mounted_evidence.get("rootfs", "")
-                    ),
-                    "observed_mounted_immutable_snapshot_time": (
-                        mounted_evidence.get("immutable", "")
-                    ),
-                }
-                if vm_health == "up"
-                else {}
-            ),
-        }
 
     return results
 
@@ -1693,193 +1793,211 @@ def _write_ddb(results):
     table = _get_ddb().Table(TENANTS_TABLE)
     now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     for tid, info in results.items():
-        # 撞号检查(create + migrate)对它们会退回 vm_num,迁移过的会有短暂盲区。这里用 vm.json
-        # 里的物理 vm_num 补齐,if_not_exists 保证只写一次、绝不覆盖(create 已写的、或先前
-        # 回填的都不动)——迁移把 vm_num 翻成 target 槽时 phys_vm_num 恒定,靠的正是"绝不覆盖"。
-        _pvn = info.get("phys_vm_num")
-        if tid not in _phys_backfilled and isinstance(_pvn, int):
+        with _tenant_write_lock(tid):
+            _write_tenant(table, tid, info, now)
+
+
+def _write_tenant(table, tid, info, now, via="poll"):
+    """Route + health write for one tenant, then promote it if it is still creating.
+
+    Caller holds _tenant_write_lock(tid). Records the status the health write
+    observed in _observed_status for the fast-promote loop.
+    """
+    # 撞号检查(create + migrate)对它们会退回 vm_num,迁移过的会有短暂盲区。这里用 vm.json
+    # 里的物理 vm_num 补齐,if_not_exists 保证只写一次、绝不覆盖(create 已写的、或先前
+    # 回填的都不动)——迁移把 vm_num 翻成 target 槽时 phys_vm_num 恒定,靠的正是"绝不覆盖"。
+    _pvn = info.get("phys_vm_num")
+    if tid not in _phys_backfilled and isinstance(_pvn, int):
+        try:
+            table.update_item(
+                Key={"id": tid},
+                UpdateExpression="SET phys_vm_num = if_not_exists(phys_vm_num, :pvn)",
+                ConditionExpression="attribute_exists(id)",
+                ExpressionAttributeValues={":pvn": _pvn},
+            )
+            _phys_backfilled.add(tid)
+        except table.meta.client.exceptions.ConditionalCheckFailedException:
+            _phys_backfilled.add(tid)  # 租户已删,别再试
+        except Exception as e:
+            print(f"phys_vm_num backfill {tid} (non-fatal): {e}")
+
+    # Skipped for down/recovering VMs to keep their last-known metrics
+    # rather than overwriting with zeros (which would mask the failure).
+    metrics = None
+    if info["vm_health"] == "up":
+        sock_file = os.path.join(VM_DIR, tid, "fc.sock")
+        data_file = os.path.join(VM_DIR, tid, "data.ext4")
+        cfg_file = os.path.join(VM_DIR, tid, "vm.json")
+        vm_mem_mb = 4096
+        vm_vcpu = 1
+        try:
+            with open(cfg_file, encoding="utf-8") as f:
+                cfg = json.load(f)
+                vm_mem_mb = cfg.get("mem_mb", 4096)
+                vm_vcpu = cfg.get("vcpu", 1) or 1
+        except Exception:
+            pass
+        fc_pid = info.get("fc_pid")
+        try:
+            metrics = _compose_metrics(
+                tid, vm_mem_mb, sock_file, data_file, fc_pid=fc_pid, vcpu=vm_vcpu
+            )
+        except Exception as e:
+            print(f"compose_metrics {tid}: {e}")
+        # Mirror computed metrics back into the in-memory snapshot so
+        # the Prometheus exporter (/metrics endpoint scraped by ADOT
+        # → AMP) sees the actual per-VM gauges. Without this only
+        # vm_health was being exposed, leaving openclaw_vm_memory_used_mb
+        # / disk_used_mb / disk_used_pct etc. empty in AMP. (Companion
+        # fix to the 8899/9090 port-mismatch — both shipped 1.2.5.)
+        if metrics is not None:
+            info["metrics"] = metrics
+
+    try:
+        # gateway 崩溃重启(schema fail-closed 拒未知 key 等)的 VM 冒充 running——
+        # ping 通但 gateway HTTP server 挂,租户对外全 502 却报 running(实测 gateway
+        # 崩 2715 次仍 running)。promote 要 VM 活(ping)且 gateway 活(18789 端口有
+        # HTTP 应答,见上面 app_health 探测:不探版本相关的具体路由,只判 HTTP server
+        # 是否应答,兼容 openclaw 2.26 无 /healthz 端点全 404 的情况)。
+        # 只 ping 通、gateway 未起的 VM 停在 creating,由 else 分支刷 health 字段,
+        # 下 tick 再 promote(不 promote ≠ 报错,只是等 gateway 就绪)。
+        if info["vm_health"] == "up" and info["app_health"] == "up":
+            # P2b (contract §3/§4): allocate host_port + write DNAT +
+            # publish Redis route BEFORE promoting. If port alloc fails
+            # (bitmap exhausted or iptables broke), skip promotion this
+            # tick — the next probe will retry. gateway_token is P1's
+            # concern (control-plane pre-mints ciphertext into DDB at
+            # create); host-agent no longer SSH-reads it (§4).
+            try:
+                host_private_ip, host_port = _ensure_route(tid, info["guest_ip"])
+            except Exception as e:
+                print(f"ensure_route {tid} failed (skip promote this tick): {e}")
+                # tenant stuck at creating; counting only one under-reports.
+                with _lock:
+                    _agent_metrics["route_ensure_failures"] += 1
+                return
+            if not host_private_ip or host_port is None:
+                print(f"ensure_route {tid} degraded (host_ip or port missing)")
+                with _lock:
+                    _agent_metrics["route_ensure_failures"] += 1
+                return
+            # Use the existing health write to observe status on EVERY tick.
+            # Running tenants still pay for just one write; a delete rollback
+            # or reused tenant ID cannot leave behind a stale promote memo.
+            # Keep this after route reconciliation so the advertised port is
+            # always the one actually installed on this host.
+            status = _refresh_health(
+                table, tid, info, now, metrics, host_port=host_port
+            )
+            _observed_status[tid] = status
+            if status != "creating":
+                return
+            # NOTE: `metrics` is a DynamoDB reserved keyword, so it must be
+            # referenced via an ExpressionAttributeNames placeholder (#m).
+            # Same for `status` (#s, already aliased). Without #m the
+            # update_item call returns ValidationException and the tenant
+            # never gets promoted to running.
+            # definitionally runs this VM (it read the local vm.json), so
+            # this self-heals a record that reached us with host_id
+            # unset/stale (e.g. a dispatch backfill that failed under
+            # throttle) — otherwise a host_id-less `running` tenant makes
+            # delete skip stop-vm/DNAT/counter-release. Gated on `#s = :c`
+            # (creating), so a migrating tenant — never `creating` — is
+            # untouched (no cross-host clobber). We do NOT write vm_num here:
+            # this is the fresh creating→running promote, whose guest_ip is
+            # already correct; the logical(DDB)↔physical(vm.json) vm_num split
+            # capacity_reservation_id:VM 已真起,容量归 running 租户合法持有,后续正常
+            # delete(按 item.vcpu 扣)回收。清掉令牌后,poller/rollback 的失败释放
+            # (条件 capacity_reservation_id=:rid)对已 running 租户落空(no-op)→ 绝不误删
+            # 活租户放置/容量(data-loss 红线)。是控制面 _mark_running 的 host-agent 对偶。
+            update_expr = (
+                "SET #s = :r, vm_health = :vh, app_health = :ah, "
+                "health_failures = :z, last_health_check = :t, "
+                "updated_at = :t, host_private_ip = :hpi, host_id = :self, "
+                "host_port = :hp, guest_ip = :gi, #m = :m "
+                "REMOVE capacity_reservation_id"
+            )
+            # NOTE (loop 2026-07-01): we tried widening this to
+            # `#s IN (creating, stopped)` to self-heal a "stopped-but-alive"
+            # contradiction, but it RACES fleet-power stop: fleet_power
+            # reconciles DDB→stopped immediately (async SSM not yet run), then
+            # this poll sees the VM still up (SSM hasn't stopped it) + DDB
+            # stopped and pulls it back to running — so after stop-vm finally
+            # writes .stopped, the VM is stopped but DDB stays running forever.
+            # That regression hits EVERY normal fleet-power stop, far worse
+            # than the rare stopped-but-alive edge (only when stop's SSM fails
+            # on a host). So promotion stays creating→running ONLY. The
+            # stopped-but-alive edge is a known limitation to fix later with a
+            # mechanism that doesn't collide with the stop path (e.g. a
+            # grace-timed sweep keyed on the missing .stopped marker).
+            update_vals = {
+                ":r": "running",
+                ":c": "creating",
+                ":vh": info["vm_health"],
+                ":ah": info["app_health"],
+                ":z": 0,
+                ":t": now,
+                ":hpi": host_private_ip,
+                ":hp": int(host_port),
+                ":gi": info["guest_ip"],
+                ":self": INSTANCE_ID,
+                ":m": metrics or {},
+            }
+            # 重投【落回同一 host】拿【新】预留(新 vm_num N2,vm_num 单调不复用),此时本机
+            # 若残留【旧】vm.json(旧 vm_num N1)会把 N2 的租户按 N1 promote → DDB 放置与实跑
+            # VM 的 vm_num 分叉。加 vm_num=:phys 闸:只 promote 【DDB vm_num == 本机 vm.json
+            # vm_num】的租户,旧 vm.json 的 N1≠N2 → 条件失败跳过(等旧 VM 被 orphan-reap 清)。
+            # phys_vm_num 缺失(legacy vm.json 无 vm_num)→ 回落仅 host_id 闸(不比现状差)。
+            _phys = info.get("phys_vm_num")
+            if _phys is not None:
+                promote_cond = (
+                    "#s = :c AND host_id = :self AND vm_num = :phys "
+                    "AND attribute_not_exists(dispatch_settle)"
+                )
+                update_vals[":phys"] = int(_phys)
+            else:
+                promote_cond = (
+                    "#s = :c AND host_id = :self "
+                    "AND attribute_not_exists(dispatch_settle)"
+                )
+            # 释放清了 host_id/token/容量但留 status=creating,本 promote 若只判 #s=:c 会把
+            # 已释放的租户"复活"成 running,而容量已扣 → 未记账的 running VM(超卖)。fence 加
+            # host_id=:self:promote 的租户来自本机 vm.json(reserve 时 host_id 已原子写成本机),
+            # 队列等待的无 host_id 租户没有本机 vm.json、根本到不了 promote。
             try:
                 table.update_item(
                     Key={"id": tid},
-                    UpdateExpression="SET phys_vm_num = if_not_exists(phys_vm_num, :pvn)",
-                    ConditionExpression="attribute_exists(id)",
-                    ExpressionAttributeValues={":pvn": _pvn},
+                    UpdateExpression=update_expr,
+                    ConditionExpression=promote_cond,
+                    ExpressionAttributeNames={"#s": "status", "#m": "metrics"},
+                    ExpressionAttributeValues=update_vals,
                 )
-                _phys_backfilled.add(tid)
+                _observed_status[tid] = "running"
+                print(
+                    f"promoted {tid} creating → running "
+                    f"(host={host_private_ip}:{host_port} guest={info['guest_ip']}"
+                    f" via={via})"
+                )
             except table.meta.client.exceptions.ConditionalCheckFailedException:
-                _phys_backfilled.add(tid)  # 租户已删,别再试
-            except Exception as e:
-                print(f"phys_vm_num backfill {tid} (non-fatal): {e}")
-
-        # Skipped for down/recovering VMs to keep their last-known metrics
-        # rather than overwriting with zeros (which would mask the failure).
-        metrics = None
-        if info["vm_health"] == "up":
-            sock_file = os.path.join(VM_DIR, tid, "fc.sock")
-            data_file = os.path.join(VM_DIR, tid, "data.ext4")
-            cfg_file = os.path.join(VM_DIR, tid, "vm.json")
-            vm_mem_mb = 4096
-            vm_vcpu = 1
-            try:
-                with open(cfg_file, encoding="utf-8") as f:
-                    cfg = json.load(f)
-                    vm_mem_mb = cfg.get("mem_mb", 4096)
-                    vm_vcpu = cfg.get("vcpu", 1) or 1
-            except Exception:
+                # Health was already refreshed. The status/owner may have
+                # changed since that write, or vm_num/dispatch_settle may still
+                # block promotion. Keep every CAS guard and retry next poll.
                 pass
-            fc_pid = info.get("fc_pid")
-            try:
-                metrics = _compose_metrics(
-                    tid, vm_mem_mb, sock_file, data_file, fc_pid=fc_pid, vcpu=vm_vcpu
-                )
-            except Exception as e:
-                print(f"compose_metrics {tid}: {e}")
-            # Mirror computed metrics back into the in-memory snapshot so
-            # the Prometheus exporter (/metrics endpoint scraped by ADOT
-            # → AMP) sees the actual per-VM gauges. Without this only
-            # vm_health was being exposed, leaving openclaw_vm_memory_used_mb
-            # / disk_used_mb / disk_used_pct etc. empty in AMP. (Companion
-            # fix to the 8899/9090 port-mismatch — both shipped 1.2.5.)
-            if metrics is not None:
-                info["metrics"] = metrics
-
-        try:
-            # gateway 崩溃重启(schema fail-closed 拒未知 key 等)的 VM 冒充 running——
-            # ping 通但 gateway HTTP server 挂,租户对外全 502 却报 running(实测 gateway
-            # 崩 2715 次仍 running)。promote 要 VM 活(ping)且 gateway 活(18789 端口有
-            # HTTP 应答,见上面 app_health 探测:不探版本相关的具体路由,只判 HTTP server
-            # 是否应答,兼容 openclaw 2.26 无 /healthz 端点全 404 的情况)。
-            # 只 ping 通、gateway 未起的 VM 停在 creating,由 else 分支刷 health 字段,
-            # 下 tick 再 promote(不 promote ≠ 报错,只是等 gateway 就绪)。
-            if info["vm_health"] == "up" and info["app_health"] == "up":
-                # P2b (contract §3/§4): allocate host_port + write DNAT +
-                # publish Redis route BEFORE promoting. If port alloc fails
-                # (bitmap exhausted or iptables broke), skip promotion this
-                # tick — the next probe will retry. gateway_token is P1's
-                # concern (control-plane pre-mints ciphertext into DDB at
-                # create); host-agent no longer SSH-reads it (§4).
-                try:
-                    host_private_ip, host_port = _ensure_route(tid, info["guest_ip"])
-                except Exception as e:
-                    print(f"ensure_route {tid} failed (skip promote this tick): {e}")
-                    # tenant stuck at creating; counting only one under-reports.
-                    with _lock:
-                        _agent_metrics["route_ensure_failures"] += 1
-                    continue
-                if not host_private_ip or host_port is None:
-                    print(f"ensure_route {tid} degraded (host_ip or port missing)")
-                    with _lock:
-                        _agent_metrics["route_ensure_failures"] += 1
-                    continue
-                # Use the existing health write to observe status on EVERY tick.
-                # Running tenants still pay for just one write; a delete rollback
-                # or reused tenant ID cannot leave behind a stale promote memo.
-                # Keep this after route reconciliation so the advertised port is
-                # always the one actually installed on this host.
-                status = _refresh_health(
-                    table, tid, info, now, metrics, host_port=host_port
-                )
-                if status != "creating":
-                    continue
-                # NOTE: `metrics` is a DynamoDB reserved keyword, so it must be
-                # referenced via an ExpressionAttributeNames placeholder (#m).
-                # Same for `status` (#s, already aliased). Without #m the
-                # update_item call returns ValidationException and the tenant
-                # never gets promoted to running.
-                # definitionally runs this VM (it read the local vm.json), so
-                # this self-heals a record that reached us with host_id
-                # unset/stale (e.g. a dispatch backfill that failed under
-                # throttle) — otherwise a host_id-less `running` tenant makes
-                # delete skip stop-vm/DNAT/counter-release. Gated on `#s = :c`
-                # (creating), so a migrating tenant — never `creating` — is
-                # untouched (no cross-host clobber). We do NOT write vm_num here:
-                # this is the fresh creating→running promote, whose guest_ip is
-                # already correct; the logical(DDB)↔physical(vm.json) vm_num split
-                # capacity_reservation_id:VM 已真起,容量归 running 租户合法持有,后续正常
-                # delete(按 item.vcpu 扣)回收。清掉令牌后,poller/rollback 的失败释放
-                # (条件 capacity_reservation_id=:rid)对已 running 租户落空(no-op)→ 绝不误删
-                # 活租户放置/容量(data-loss 红线)。是控制面 _mark_running 的 host-agent 对偶。
-                update_expr = (
-                    "SET #s = :r, vm_health = :vh, app_health = :ah, "
-                    "health_failures = :z, last_health_check = :t, "
-                    "updated_at = :t, host_private_ip = :hpi, host_id = :self, "
-                    "host_port = :hp, guest_ip = :gi, #m = :m "
-                    "REMOVE capacity_reservation_id"
-                )
-                # NOTE (loop 2026-07-01): we tried widening this to
-                # `#s IN (creating, stopped)` to self-heal a "stopped-but-alive"
-                # contradiction, but it RACES fleet-power stop: fleet_power
-                # reconciles DDB→stopped immediately (async SSM not yet run), then
-                # this poll sees the VM still up (SSM hasn't stopped it) + DDB
-                # stopped and pulls it back to running — so after stop-vm finally
-                # writes .stopped, the VM is stopped but DDB stays running forever.
-                # That regression hits EVERY normal fleet-power stop, far worse
-                # than the rare stopped-but-alive edge (only when stop's SSM fails
-                # on a host). So promotion stays creating→running ONLY. The
-                # stopped-but-alive edge is a known limitation to fix later with a
-                # mechanism that doesn't collide with the stop path (e.g. a
-                # grace-timed sweep keyed on the missing .stopped marker).
-                update_vals = {
-                    ":r": "running",
-                    ":c": "creating",
-                    ":vh": info["vm_health"],
-                    ":ah": info["app_health"],
-                    ":z": 0,
-                    ":t": now,
-                    ":hpi": host_private_ip,
-                    ":hp": int(host_port),
-                    ":gi": info["guest_ip"],
-                    ":self": INSTANCE_ID,
-                    ":m": metrics or {},
-                }
-                # 重投【落回同一 host】拿【新】预留(新 vm_num N2,vm_num 单调不复用),此时本机
-                # 若残留【旧】vm.json(旧 vm_num N1)会把 N2 的租户按 N1 promote → DDB 放置与实跑
-                # VM 的 vm_num 分叉。加 vm_num=:phys 闸:只 promote 【DDB vm_num == 本机 vm.json
-                # vm_num】的租户,旧 vm.json 的 N1≠N2 → 条件失败跳过(等旧 VM 被 orphan-reap 清)。
-                # phys_vm_num 缺失(legacy vm.json 无 vm_num)→ 回落仅 host_id 闸(不比现状差)。
-                _phys = info.get("phys_vm_num")
-                if _phys is not None:
-                    promote_cond = (
-                        "#s = :c AND host_id = :self AND vm_num = :phys "
-                        "AND attribute_not_exists(dispatch_settle)"
-                    )
-                    update_vals[":phys"] = int(_phys)
-                else:
-                    promote_cond = (
-                        "#s = :c AND host_id = :self "
-                        "AND attribute_not_exists(dispatch_settle)"
-                    )
-                # 释放清了 host_id/token/容量但留 status=creating,本 promote 若只判 #s=:c 会把
-                # 已释放的租户"复活"成 running,而容量已扣 → 未记账的 running VM(超卖)。fence 加
-                # host_id=:self:promote 的租户来自本机 vm.json(reserve 时 host_id 已原子写成本机),
-                # 队列等待的无 host_id 租户没有本机 vm.json、根本到不了 promote。
-                try:
-                    table.update_item(
-                        Key={"id": tid},
-                        UpdateExpression=update_expr,
-                        ConditionExpression=promote_cond,
-                        ExpressionAttributeNames={"#s": "status", "#m": "metrics"},
-                        ExpressionAttributeValues=update_vals,
-                    )
-                    print(
-                        f"promoted {tid} creating → running "
-                        f"(host={host_private_ip}:{host_port} guest={info['guest_ip']})"
-                    )
-                except table.meta.client.exceptions.ConditionalCheckFailedException:
-                    # Health was already refreshed. The status/owner may have
-                    # changed since that write, or vm_num/dispatch_settle may still
-                    # block promotion. Keep every CAS guard and retry next poll.
-                    pass
-            else:
-                # Not promoted this tick (still creating w/ gateway not up, or a
-                # health-only refresh for a down VM). Reconcile + guard in the
-                # shared helper (attribute_exists(id) + host_id ownership).
-                _refresh_health(table, tid, info, now, metrics)
-        except Exception as e:
-            # Expected here: _refresh_health's CCF for a deleted / migrated-away
-            # tenant (its guard failed cleanly), plus any transient DDB error.
-            # Logged, never crashes the poll loop.
-            print(f"ddb update {tid}: {e}")
+        else:
+            # Not promoted this tick (still creating w/ gateway not up, or a
+            # health-only refresh for a down VM). Reconcile + guard in the
+            # shared helper (attribute_exists(id) + host_id ownership).
+            _observed_status[tid] = _refresh_health(table, tid, info, now, metrics)
+    except table.meta.client.exceptions.ConditionalCheckFailedException as e:
+        # The health write's guard failed: the tenant is deleted or owned by another
+        # host. Not a fast-promote candidate until a later write says otherwise.
+        _observed_status[tid] = "not-ours"
+        print(f"ddb update {tid}: {e}")
+    except Exception as e:
+        # Expected here: _refresh_health's CCF for a deleted / migrated-away
+        # tenant (its guard failed cleanly), plus any transient DDB error.
+        # Logged, never crashes the poll loop.
+        print(f"ddb update {tid}: {e}")
 
 
 # ═══════════════════════════════════════════
@@ -4923,6 +5041,113 @@ def _reconcile_egress():
         )
 
 
+def _fast_promote_candidates(now_epoch):
+    """Recently launched VMs whose last observed status is creating (or not seen yet)."""
+    try:
+        entries = os.listdir(VM_DIR)
+    except FileNotFoundError:
+        return []
+    mono = time.monotonic()
+    out = []
+    for tid in entries:
+        if _observed_status.get(tid, "creating") != "creating":
+            continue
+        if mono < _fast_retry_at.get(tid, 0):
+            continue
+        vm_path = os.path.join(VM_DIR, tid)
+        try:
+            mtime = os.stat(os.path.join(vm_path, "vm.json")).st_mtime
+        except OSError:
+            continue
+        if now_epoch - mtime > FAST_PROMOTE_WINDOW_SEC:
+            continue
+        if os.path.exists(os.path.join(vm_path, ".stopped")):
+            continue
+        out.append(tid)
+    return out
+
+
+def _fast_probe(tid, pid_index):
+    """Probe result if the VM and its gateway are both up, else None.
+
+    Read-only: recovery, relaunch and net-dead counting stay with the poll loop.
+    """
+    vm_path = os.path.join(VM_DIR, tid)
+    try:
+        with open(os.path.join(vm_path, "vm.json"), encoding="utf-8") as f:
+            cfg = json.load(f)
+    except Exception:
+        return None
+    guest_ip = cfg.get("guest_ip", "")
+    fc_pid = pid_index.get(os.path.join(vm_path, "fc.sock"))
+    if not guest_ip or fc_pid is None:
+        return None
+    try:
+        r = subprocess.run(
+            ["ping", "-c", "1", "-W", "1", guest_ip], capture_output=True, timeout=3
+        )
+    except Exception:
+        return None
+    if r.returncode != 0:
+        return None
+    if _probe_app_health(guest_ip, cfg.get("chat_ep", 0)) != "up":
+        return None
+    return _probed_result(
+        fc_pid,
+        guest_ip,
+        cfg.get("vm_num"),
+        cfg.get("image_snapshot_time") or "",
+        "up",
+        "up",
+    )
+
+
+def _fast_promote_once():
+    """Promote every candidate whose gateway answers now. Returns how many were written."""
+    if not TENANTS_TABLE:
+        return 0
+    candidates = _fast_promote_candidates(time.time())
+    if not candidates:
+        return 0
+    pid_index = _fc_pid_index()
+    if pid_index is None:
+        return 0
+    with ThreadPoolExecutor(max_workers=max(1, FAST_PROMOTE_PARALLEL)) as ex:
+        probed = list(ex.map(lambda t: (t, _fast_probe(t, pid_index)), candidates))
+    ready = [(tid, info) for tid, info in probed if info is not None]
+    if not ready:
+        return 0
+    table = _get_ddb().Table(TENANTS_TABLE)
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    written = 0
+    for tid, info in ready:
+        lk = _tenant_write_lock(tid)
+        if not lk.acquire(blocking=False):
+            continue  # the poll loop is writing this tenant right now
+        try:
+            _write_tenant(table, tid, info, now, via="fast")
+        finally:
+            lk.release()
+        written += 1
+        if _observed_status.get(tid, "creating") == "creating":
+            # Healthy but not promoted: a CAS guard (vm_num, dispatch_settle) or a
+            # route failure is still blocking. Do not rewrite it every second.
+            _fast_retry_at[tid] = time.monotonic() + FAST_PROMOTE_RETRY_SEC
+        with _lock:
+            _status[tid] = {**info, "updated_at": now}
+    return written
+
+
+def _fast_promote_loop():
+    while True:
+        try:
+            _fast_promote_once()
+        except Exception as e:
+            print(f"fast promote error: {e}")
+        _agent_loop_tick("fast_promote")
+        time.sleep(FAST_PROMOTE_INTERVAL)
+
+
 def _poll_loop():
     while True:
         try:
@@ -4931,6 +5156,7 @@ def _poll_loop():
             _write_host_heartbeat()
             _reap_orphan_firecrackers()
             results = _probe_all()
+            _prune_tenant_state(set(os.listdir(VM_DIR)) if os.path.isdir(VM_DIR) else set())
             ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
             with _lock:
                 _status.clear()
@@ -5055,6 +5281,13 @@ def main():
         print(f"port_bitmap startup recovery failed (stays lazy): {e}")
     t = threading.Thread(target=_poll_loop, daemon=True)
     t.start()
+    if FAST_PROMOTE_INTERVAL > 0 and TENANTS_TABLE:
+        print(
+            f"openclaw-agent fast promote: every {FAST_PROMOTE_INTERVAL}s, "
+            f"window={FAST_PROMOTE_WINDOW_SEC}s parallel={FAST_PROMOTE_PARALLEL}"
+        )
+        fp = threading.Thread(target=_fast_promote_loop, daemon=True)
+        fp.start()
     # stuck rm -rf never blocks heartbeat → no false stale-restart).
     g = threading.Thread(target=_disk_gc_loop, daemon=True)
     g.start()

@@ -496,9 +496,10 @@ _fast_backoff = {}  # tenant_id -> last back-off delay after a probe found it no
 # Monotonic start time of the newest probe written per tenant. The two loops probe
 # independently, so a poll result taken before a fast-promote write can reach the
 # lock after it; _write_tenant drops such an older result instead of writing it.
-# A fast write counts only if it promoted: one held back by a CAS guard is retried
-# every FAST_PROMOTE_RETRY_SEC, and counting it would drop every poll result (and
-# its metrics) for that tenant.
+# Only the health and promote writes are dropped: an older poll result still writes
+# its metrics, which the fast loop never collects. Otherwise a tenant the fast loop
+# rewrites every FAST_PROMOTE_RETRY_SEC (held in creating by a CAS guard) would get
+# no metrics at all.
 _last_probe_at = {}
 
 
@@ -1866,20 +1867,87 @@ def _write_route(tid, info):
     return host_private_ip, host_port
 
 
+def _collect_metrics(tid, info, via):
+    """Per-VM metrics for a poll write, mirrored into info; None if not collected.
+
+    Skipped for down/recovering VMs to keep their last-known metrics
+    rather than overwriting with zeros (which would mask the failure).
+    Also skipped on the fast path: balloon stats and dumpe2fs can take seconds,
+    the fast loop writes one tenant at a time, and the next poll fills them in.
+    """
+    if info["vm_health"] != "up" or via == "fast":
+        return None
+    metrics = None
+    sock_file = os.path.join(VM_DIR, tid, "fc.sock")
+    data_file = os.path.join(VM_DIR, tid, "data.ext4")
+    cfg_file = os.path.join(VM_DIR, tid, "vm.json")
+    vm_mem_mb = 4096
+    vm_vcpu = 1
+    try:
+        with open(cfg_file, encoding="utf-8") as f:
+            cfg = json.load(f)
+            vm_mem_mb = cfg.get("mem_mb", 4096)
+            vm_vcpu = cfg.get("vcpu", 1) or 1
+    except Exception:
+        pass
+    fc_pid = info.get("fc_pid")
+    try:
+        metrics = _compose_metrics(
+            tid, vm_mem_mb, sock_file, data_file, fc_pid=fc_pid, vcpu=vm_vcpu
+        )
+    except Exception as e:
+        print(f"compose_metrics {tid}: {e}")
+    # Mirror computed metrics back into the in-memory snapshot so
+    # the Prometheus exporter (/metrics endpoint scraped by ADOT
+    # → AMP) sees the actual per-VM gauges. Without this only
+    # vm_health was being exposed, leaving openclaw_vm_memory_used_mb
+    # / disk_used_mb / disk_used_pct etc. empty in AMP. (Companion
+    # fix to the 8899/9090 port-mismatch — both shipped 1.2.5.)
+    if metrics is not None:
+        info["metrics"] = metrics
+    return metrics
+
+
+def _write_older_metrics(table, tid, info, via):
+    """Write only the metrics of a result older than the last one written.
+
+    Its health fields are older than what DDB and /metrics already hold, so they
+    are dropped; the metrics are not, since the fast loop never collects them.
+    """
+    metrics = _collect_metrics(tid, info, via)
+    if metrics is None:
+        return
+    with _lock:
+        current = _status.get(tid)
+        if current is not None:
+            current["metrics"] = metrics
+    try:
+        table.update_item(
+            Key={"id": tid},
+            UpdateExpression="SET #m = :m",
+            ConditionExpression="attribute_exists(id) AND host_id = :self",
+            ExpressionAttributeNames={"#m": "metrics"},
+            ExpressionAttributeValues={":m": metrics, ":self": INSTANCE_ID},
+        )
+    except table.meta.client.exceptions.ConditionalCheckFailedException:
+        pass  # deleted or owned by another host
+    except Exception as e:
+        print(f"ddb metrics update {tid}: {e}")
+
+
 def _write_tenant(table, tid, info, now, via="poll"):
     """Route + health write for one tenant, then promote it if it is still creating.
 
     Caller holds _tenant_write_lock(tid). Records the status the health write
     observed in _observed_status for the fast-promote loop. A result whose probe
-    started before the last one written for this tenant is dropped. Returns True
-    if this write promoted the tenant.
+    started before the last one written for this tenant writes only its metrics.
     """
     probed_at = info.get("probed_at")
     if probed_at is not None:
         if probed_at < _last_probe_at.get(tid, probed_at):
-            return False
-        if via != "fast":
-            _last_probe_at[tid] = probed_at
+            _write_older_metrics(table, tid, info, via)
+            return
+        _last_probe_at[tid] = probed_at
     # 撞号检查(create + migrate)对它们会退回 vm_num,迁移过的会有短暂盲区。这里用 vm.json
     # 里的物理 vm_num 补齐,if_not_exists 保证只写一次、绝不覆盖(create 已写的、或先前
     # 回填的都不动)——迁移把 vm_num 翻成 target 槽时 phys_vm_num 恒定,靠的正是"绝不覆盖"。
@@ -1898,39 +1966,7 @@ def _write_tenant(table, tid, info, now, via="poll"):
         except Exception as e:
             print(f"phys_vm_num backfill {tid} (non-fatal): {e}")
 
-    # Skipped for down/recovering VMs to keep their last-known metrics
-    # rather than overwriting with zeros (which would mask the failure).
-    # Also skipped on the fast path: balloon stats and dumpe2fs can take seconds,
-    # the fast loop writes one tenant at a time, and the next poll fills them in.
-    metrics = None
-    if info["vm_health"] == "up" and via != "fast":
-        sock_file = os.path.join(VM_DIR, tid, "fc.sock")
-        data_file = os.path.join(VM_DIR, tid, "data.ext4")
-        cfg_file = os.path.join(VM_DIR, tid, "vm.json")
-        vm_mem_mb = 4096
-        vm_vcpu = 1
-        try:
-            with open(cfg_file, encoding="utf-8") as f:
-                cfg = json.load(f)
-                vm_mem_mb = cfg.get("mem_mb", 4096)
-                vm_vcpu = cfg.get("vcpu", 1) or 1
-        except Exception:
-            pass
-        fc_pid = info.get("fc_pid")
-        try:
-            metrics = _compose_metrics(
-                tid, vm_mem_mb, sock_file, data_file, fc_pid=fc_pid, vcpu=vm_vcpu
-            )
-        except Exception as e:
-            print(f"compose_metrics {tid}: {e}")
-        # Mirror computed metrics back into the in-memory snapshot so
-        # the Prometheus exporter (/metrics endpoint scraped by ADOT
-        # → AMP) sees the actual per-VM gauges. Without this only
-        # vm_health was being exposed, leaving openclaw_vm_memory_used_mb
-        # / disk_used_mb / disk_used_pct etc. empty in AMP. (Companion
-        # fix to the 8899/9090 port-mismatch — both shipped 1.2.5.)
-        if metrics is not None:
-            info["metrics"] = metrics
+    metrics = _collect_metrics(tid, info, via)
 
     try:
         # gateway 崩溃重启(schema fail-closed 拒未知 key 等)的 VM 冒充 running——
@@ -2048,14 +2084,11 @@ def _write_tenant(table, tid, info, now, via="poll"):
                     ExpressionAttributeValues=update_vals,
                 )
                 _observed_status[tid] = "running"
-                if probed_at is not None:
-                    _last_probe_at[tid] = probed_at
                 print(
                     f"promoted {tid} creating → running "
                     f"(host={host_private_ip}:{host_port} guest={info['guest_ip']}"
                     f" via={via})"
                 )
-                return True
             except table.meta.client.exceptions.ConditionalCheckFailedException:
                 # Health was already refreshed. The status/owner may have
                 # changed since that write, or vm_num/dispatch_settle may still
@@ -5217,19 +5250,20 @@ def _fast_promote_write(tid, info):
         return False  # the poll loop is writing this tenant right now
     now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     try:
-        promoted = _write_tenant(
-            _get_ddb().Table(TENANTS_TABLE), tid, info, now, via="fast"
-        )
+        _write_tenant(_get_ddb().Table(TENANTS_TABLE), tid, info, now, via="fast")
     finally:
         lk.release()
     if _observed_status.get(tid, "creating") == "creating":
         # Healthy but not promoted: a CAS guard (vm_num, dispatch_settle) or a
         # route failure is still blocking. Do not rewrite it every second.
         _fast_retry_at[tid] = time.monotonic() + FAST_PROMOTE_RETRY_SEC
-    if promoted:
-        # Otherwise the poll pass's entry, which carries the metrics, stays.
-        with _lock:
-            _status[tid] = _newer_status(_status.get(tid), {**info, "updated_at": now})
+    with _lock:
+        previous = _status.get(tid)
+        entry = _newer_status(previous, {**info, "updated_at": now})
+        if entry is not previous and previous and "metrics" in previous:
+            # The fast probe collects no metrics: keep the last ones the poll wrote.
+            entry.setdefault("metrics", previous["metrics"])
+        _status[tid] = entry
     return True
 
 

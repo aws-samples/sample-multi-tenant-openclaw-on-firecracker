@@ -314,6 +314,7 @@ def test_vm_whose_gateway_never_answers_is_backed_off(env):
     assert "t-1" not in agent._fast_backoff
 
 
+
 @pytest.mark.parametrize("item", [None, {"host_id": "i-other"}, {"vm_num": 2}])
 def test_fast_path_keeps_every_ownership_guard(env, item):
     sock = _vm(env)
@@ -466,9 +467,10 @@ def test_poll_result_probed_before_a_fast_write_is_dropped(env):
     assert _fast({sock: 4242}) == 1  # ...the fast loop promotes it meanwhile...
     env.writes.reset_mock()
     agent._write_ddb({"t-1": old})  # ...then the poll pass reaches the lock
-    env.writes.assert_not_called()
     item = env.table.get_item(Key={"id": "t-1"})["Item"]
     assert (item["status"], item["app_health"]) == ("running", "up")
+    assert item["metrics"] == {"cpu_pct": 0}  # only its metrics were written
+    assert env.writes.call_count == 1
     # A probe that started after the fast write is written as usual.
     agent._write_ddb({"t-1": {**old, "probed_at": time.monotonic()}})
     assert env.table.get_item(Key={"id": "t-1"})["Item"]["app_health"] == "down"
@@ -483,12 +485,32 @@ def test_blocked_tenant_still_gets_poll_metrics(env):
     before = time.monotonic()
     assert _fast({sock: 4242}) == 1
     assert _status(env) == "creating"
-    assert "t-1" not in agent._status  # the fast write promoted nothing
     agent._write_ddb({"t-1": {"vm_health": "up", "app_health": "up",
                               "guest_ip": "172.16.0.2", "phys_vm_num": 1,
                               "fc_pid": 4242, "probed_at": before}})
     item = env.table.get_item(Key={"id": "t-1"})["Item"]
     assert (item["status"], item["metrics"]) == ("creating", {"cpu_pct": 0})
+    assert agent._status["t-1"]["metrics"] == {"cpu_pct": 0}
+    # The next fast write keeps those metrics in /metrics.
+    agent._fast_retry_at.clear()
+    assert _fast({sock: 4242}) == 1
+    assert agent._status["t-1"]["metrics"] == {"cpu_pct": 0}
+
+
+def test_older_poll_result_does_not_regress_a_running_tenants_health(env):
+    # After an agent restart _observed_status is empty, so a recently created
+    # tenant that is already running is a fast candidate again. Its fast write
+    # promotes nothing, yet an older poll result must still not overwrite it.
+    sock = _vm(env)
+    _put(env, status="running", app_health="up")
+    before = time.monotonic()
+    assert _fast({sock: 4242}) == 1
+    agent._write_ddb({"t-1": {"vm_health": "up", "app_health": "down",
+                              "guest_ip": "172.16.0.2", "phys_vm_num": 1,
+                              "fc_pid": 4242, "probed_at": before}})
+    item = env.table.get_item(Key={"id": "t-1"})["Item"]
+    assert (item["status"], item["app_health"]) == ("running", "up")
+    assert item["metrics"] == {"cpu_pct": 0}
 
 
 def test_metrics_snapshot_keeps_the_newer_probe():

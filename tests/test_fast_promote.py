@@ -1,7 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: MIT-0
 
-"""Creation latency on dense hosts: fast promote, one pgrep per pass, DNAT cache.
+"""Creation latency on dense hosts: fast promote, one pgrep per pass.
 
 A creating tenant used to be promoted only by the serial poll pass, whose length
 grows with the VMs on the host (~25 s at 290 VMs), so API -> running was ~50 s on
@@ -9,6 +9,7 @@ a full host and ~30 s on an empty one. The fast-promote loop promotes it within
 about a second of the gateway answering, through the same guarded writes.
 """
 
+import contextlib
 import importlib.util
 import json
 import os
@@ -35,6 +36,7 @@ with patch("boto3.resource"), patch("boto3.client"):
     sys.modules[spec.name] = agent
     spec.loader.exec_module(agent)
 route_ops = agent.route_ops
+_ensure_route = agent._ensure_route  # the env fixture stubs it; _real_route restores it
 
 
 def _proc(stdout="", returncode=0):
@@ -334,7 +336,7 @@ def test_prune_forgets_tenants_that_left_the_host():
     assert agent._observed_status["here"] == "creating"
 
 
-# ─── DNAT listing reuse ─────────────────────────────────────────
+# ─── routes always check the live DNAT rules ────────────────────
 
 
 @pytest.fixture
@@ -346,49 +348,14 @@ def nat():
         lists.append(1)
         return dict(rules)
 
-    route_ops._rules_cache = None
     with (
         patch.object(route_ops, "list_dnat_rules", side_effect=fake_list),
-        patch.object(route_ops, "dnat_check", return_value=False),
+        patch.object(route_ops, "dnat_check", side_effect=lambda p, g: rules.get(p) == g),
         patch.object(route_ops, "dnat_add", side_effect=lambda p, g: rules.__setitem__(p, g)),
         patch.object(route_ops, "dnat_remove_all", side_effect=lambda p, g: rules.pop(p, None)),
         patch.object(route_ops, "add_quarantine"),
     ):
         yield SimpleNamespace(rules=rules, lists=lists, bitmap=route_ops.PortBitmap())
-    route_ops._rules_cache = None
-
-
-def test_poll_pass_reuses_one_listing_for_existing_routes(nat):
-    for _ in range(50):
-        assert route_ops.ensure_port_and_dnat(nat.bitmap, "172.16.0.2", max_age=60) == 10000
-    assert len(nat.lists) == 1
-
-
-def test_default_call_still_lists_live_rules_every_time(nat):
-    for _ in range(3):
-        route_ops.ensure_port_and_dnat(nat.bitmap, "172.16.0.2")
-    assert len(nat.lists) == 3
-
-
-def test_allocation_always_relists_live_rules(nat):
-    route_ops.ensure_port_and_dnat(nat.bitmap, "172.16.0.2", max_age=60)
-    # Another process installs a rule on the next free port behind our back.
-    nat.rules[10001] = "172.16.0.9"
-    port = route_ops.ensure_port_and_dnat(nat.bitmap, "172.16.0.3", max_age=60)
-    assert len(nat.lists) == 2
-    assert port not in (10000, 10001)
-    assert nat.rules[port] == "172.16.0.3"
-
-
-def test_expired_or_released_listing_is_not_reused(nat):
-    route_ops.ensure_port_and_dnat(nat.bitmap, "172.16.0.2", max_age=60)
-    route_ops._rules_cache = (time.monotonic() - 120, route_ops._rules_cache[1])
-    route_ops.ensure_port_and_dnat(nat.bitmap, "172.16.0.2", max_age=60)
-    assert len(nat.lists) == 2
-    route_ops.release_port_and_dnat(nat.bitmap, 10000, "172.16.0.2")
-    port = route_ops.ensure_port_and_dnat(nat.bitmap, "172.16.0.2", max_age=60)
-    assert len(nat.lists) == 3
-    assert nat.rules == {port: "172.16.0.2"}
 
 
 def test_ready_tenant_is_written_while_another_probe_is_still_running(env):
@@ -469,47 +436,61 @@ def test_metrics_snapshot_keeps_the_newer_probe():
     assert agent._newer_status(None, legacy) is legacy
 
 
+class _Redis:
+    def __init__(self):
+        self.routes = {}
+
+    def set_route(self, tid, host_ip, port, guest_ip):
+        self.routes[tid] = (port, guest_ip)
+        return True
+
+
+@contextlib.contextmanager
 def _real_route(nat):
-    def ensure(tid, guest_ip, max_age=0.0):
-        return "10.0.0.1", route_ops.ensure_port_and_dnat(nat.bitmap, guest_ip, max_age=max_age)
-    return patch.object(agent, "_ensure_route", side_effect=ensure)
+    """The real _ensure_route against fake iptables; yields the fake Redis."""
+    redis = _Redis()
+    with (
+        patch.object(agent, "_ensure_route", _ensure_route),
+        patch.object(agent, "_get_host_private_ip", return_value="10.0.0.1"),
+        patch.object(agent, "_get_port_bitmap", return_value=nat.bitmap),
+        patch.object(agent, "_get_redis_writer", return_value=redis),
+    ):
+        yield redis
 
 
-def test_promote_checks_live_dnat_even_when_the_listing_is_cached(env, nat):
+def _released_by_another_process(nat, port=10000):
+    # What delete-vm.sh (route_ops.py delete-route) does from its own process:
+    # the agent is not told, and the port becomes reusable after the quarantine.
+    nat.rules.pop(port)
+    nat.bitmap.free(port)
+
+
+def test_running_tenant_route_is_never_left_on_a_released_port(env, nat):
+    # The poll pass probed a running tenant up, then delete-vm.sh released its
+    # port before the pass reached it. Its route must not stay on that port: once
+    # the quarantine expires the port is handed to the next tenant created here.
+    _put(env, status="running")
+    up = {"vm_health": "up", "app_health": "up", "guest_ip": "172.16.0.2",
+          "phys_vm_num": 1, "fc_pid": 1}
+    with _real_route(nat) as redis:
+        agent._write_ddb({"t-1": dict(up)})
+        _released_by_another_process(nat)
+        agent._write_ddb({"t-1": dict(up)})
+    port, _ = redis.routes["t-1"]
+    assert nat.rules.get(port) == "172.16.0.2"
+
+
+def test_promote_checks_live_dnat(env, nat):
     sock = _vm(env)
     _put(env)
-    route_ops.ensure_port_and_dnat(nat.bitmap, "172.16.0.2", max_age=60)  # warm cache
-    nat.rules.clear()  # another process (route_ops CLI over SSM) removed the DNAT
-    with _real_route(nat):
+    route_ops.ensure_port_and_dnat(nat.bitmap, "172.16.0.2")
+    _released_by_another_process(nat)
+    with _real_route(nat) as redis:
         assert _fast({sock: 4242}) == 1
     item = env.table.get_item(Key={"id": "t-1"})["Item"]
     assert item["status"] == "running"
     assert nat.rules.get(int(item["host_port"])) == "172.16.0.2"
-
-
-def test_only_running_tenants_refresh_from_the_cached_listing(env, nat):
-    _put(env, status="running")
-    agent._observed_status["t-1"] = "running"
-    info = {"vm_health": "up", "app_health": "up", "guest_ip": "172.16.0.2",
-            "phys_vm_num": 1, "fc_pid": 1}
-    with _real_route(nat):
-        for _ in range(3):
-            agent._write_ddb({"t-1": dict(info)})
-    assert len(nat.lists) == 1
-
-
-def test_rollback_to_creating_is_promoted_on_live_dnat(env, nat):
-    _put(env)  # a delete rolled back to creating
-    agent._observed_status["t-1"] = "running"  # ...since our last write saw running
-    route_ops.ensure_port_and_dnat(nat.bitmap, "172.16.0.2", max_age=60)
-    nat.rules.clear()
-    with _real_route(nat):
-        agent._write_ddb({"t-1": {"vm_health": "up", "app_health": "up",
-                                  "guest_ip": "172.16.0.2", "phys_vm_num": 1,
-                                  "fc_pid": 1}})
-    item = env.table.get_item(Key={"id": "t-1"})["Item"]
-    assert item["status"] == "running"
-    assert nat.rules.get(int(item["host_port"])) == "172.16.0.2"
+    assert redis.routes["t-1"] == (int(item["host_port"]), "172.16.0.2")
 
 
 def test_fast_write_leaves_metrics_to_the_poll_loop(env):

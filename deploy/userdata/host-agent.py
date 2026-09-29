@@ -54,9 +54,6 @@ FAST_PROMOTE_PARALLEL = int(os.environ.get("OC_AGENT_FAST_PROMOTE_PARALLEL", "8"
 FAST_PROMOTE_PROBE_TIMEOUT_SEC = float(
     os.environ.get("OC_AGENT_FAST_PROMOTE_PROBE_TIMEOUT_SEC", "2")
 )
-# The poll pass reuses one `iptables -t nat -S PREROUTING` listing for this long when
-# the tenant's DNAT rule is already in it. Allocation always re-lists live rules.
-ROUTE_RULES_MAX_AGE_SEC = float(os.environ.get("OC_AGENT_ROUTE_RULES_MAX_AGE_SEC", "5"))
 PORT = int(os.environ.get("OC_AGENT_PORT", "8899"))
 # Health/control AND Prometheus /metrics are served by the SAME HTTPServer
 # on PORT (8899). The earlier OC_AGENT_PROM_PORT=9090 split-port design was
@@ -678,9 +675,7 @@ def _get_redis_writer() -> route_ops.RedisRouteWriter | None:
         return _redis_writer
 
 
-def _ensure_route(
-    tenant_id: str, guest_ip: str, max_age: float = 0.0
-) -> tuple[str, int | None]:
+def _ensure_route(tenant_id: str, guest_ip: str) -> tuple[str, int | None]:
     """Contract §3: allocate a host port + write PREROUTING DNAT for this
     tenant, then §1: write `route:{tenant_id}` to Redis. Idempotent per
     tenant: if the DDB descriptor already carries a host_port and the
@@ -693,13 +688,14 @@ def _ensure_route(
     Redis write failure does NOT propagate: contract §6 HA — DDB is
     authoritative and route.lua fail-static handles the transient gap.
 
-    max_age > 0 may answer from a DNAT listing that old, which another process
-    (route_ops CLI over SSM) could have changed since. Only refreshes of tenants
-    already running pass it; a promote always checks the live rules.
+    Always checks the live DNAT rules: another process (delete-vm.sh, the
+    route_ops CLI over SSM) may have released this tenant's port since the last
+    tick, and a route written to that port from a stale listing points at
+    whoever is allocated it after the quarantine.
     """
     host_ip = _get_host_private_ip()
     bitmap = _get_port_bitmap()
-    port = route_ops.ensure_port_and_dnat(bitmap, guest_ip, max_age=max_age)
+    port = route_ops.ensure_port_and_dnat(bitmap, guest_ip)
     writer = _get_redis_writer()
     if writer is not None and host_ip:
         writer.set_route(tenant_id, host_ip, port, guest_ip)
@@ -1821,10 +1817,10 @@ def _write_ddb(results):
             _write_tenant(table, tid, info, now)
 
 
-def _write_route(tid, info, max_age):
+def _write_route(tid, info):
     """_ensure_route for _write_tenant: (host_ip, port), or None to skip this tick."""
     try:
-        host_private_ip, host_port = _ensure_route(tid, info["guest_ip"], max_age)
+        host_private_ip, host_port = _ensure_route(tid, info["guest_ip"])
     except Exception as e:
         print(f"ensure_route {tid} failed (skip promote this tick): {e}")
         # tenant stuck at creating; counting only one under-reports.
@@ -1918,12 +1914,7 @@ def _write_tenant(table, tid, info, now, via="poll"):
             # tick — the next probe will retry. gateway_token is P1's
             # concern (control-plane pre-mints ciphertext into DDB at
             # create); host-agent no longer SSH-reads it (§4).
-            # A tenant last seen running may answer from the poll pass's cached DNAT
-            # listing; anything that may be promoted checks the live rules.
-            cached_ok = _observed_status.get(tid) == "running"
-            route = _write_route(
-                tid, info, ROUTE_RULES_MAX_AGE_SEC if cached_ok else 0.0
-            )
+            route = _write_route(tid, info)
             if route is None:
                 return
             host_private_ip, host_port = route
@@ -1938,12 +1929,6 @@ def _write_tenant(table, tid, info, now, via="poll"):
             _observed_status[tid] = status
             if status != "creating":
                 return
-            if cached_ok:
-                # Rolled back to creating while we still thought it was running.
-                route = _write_route(tid, info, 0.0)
-                if route is None:
-                    return
-                host_private_ip, host_port = route
             # NOTE: `metrics` is a DynamoDB reserved keyword, so it must be
             # referenced via an ExpressionAttributeNames placeholder (#m).
             # Same for `status` (#s, already aliased). Without #m the

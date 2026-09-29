@@ -374,18 +374,11 @@ def list_dnat_rules() -> dict[int, str]:
 
 
 _alloc_lock = threading.Lock()
-# (monotonic time, {host_port: guest_ip}) of the last live listing in this process.
-# Guarded by _alloc_lock. Only the reuse path of ensure_port_and_dnat reads it, and
-# only when the caller passes max_age; allocation always lists live rules, because
-# another process (the route_ops CLI) may have changed PREROUTING since.
-_rules_cache: tuple[float, dict[int, str]] | None = None
 
 
 def _refresh_bitmap_locked(bitmap: PortBitmap) -> dict[int, str]:
     """Replace the bitmap from live rules while the allocation lock is held."""
-    global _rules_cache
     rules = list_dnat_rules()
-    _rules_cache = (time.monotonic(), rules)
     bitmap.replace_used(
         {
             port
@@ -407,8 +400,6 @@ def rebuild_bitmap_from_iptables(bitmap: PortBitmap) -> int:
 
 # ─── Atomic alloc + DNAT ────────────────────────────────────────
 def _alloc_and_dnat_locked(bitmap: PortBitmap, guest_ip: str) -> int:
-    global _rules_cache
-    _rules_cache = None
     port = bitmap.alloc()
     try:
         if dnat_check(port, guest_ip):
@@ -434,33 +425,16 @@ def alloc_and_dnat_atomic(bitmap: PortBitmap, guest_ip: str) -> int:
         return _alloc_and_dnat_locked(bitmap, guest_ip)
 
 
-def _reusable_port(rules: dict[int, str], guest_ip: str) -> int | None:
-    for port, rule_guest in sorted(rules.items()):
-        if rule_guest == guest_ip and PORT_RANGE_LOW <= port <= PORT_RANGE_HIGH:
-            return port
-    return None
-
-
-def ensure_port_and_dnat(
-    bitmap: PortBitmap, guest_ip: str, max_age: float = 0.0
-) -> int:
-    """Refresh live state, then reuse or allocate one route atomically.
-
-    max_age > 0 lets a caller that ensures many routes in a row (the host-agent
-    poll pass, one call per running tenant) reuse a listing up to that many
-    seconds old when it already holds this guest's rule. A miss always falls
-    through to a live listing before allocating.
-    """
+def ensure_port_and_dnat(bitmap: PortBitmap, guest_ip: str) -> int:
+    """Refresh live state, then reuse or allocate one route atomically."""
     with _alloc_lock:
-        cached = _rules_cache
-        if max_age > 0 and cached is not None and time.monotonic() - cached[0] <= max_age:
-            port = _reusable_port(cached[1], guest_ip)
-            if port is not None:
-                return port
         rules = _refresh_bitmap_locked(bitmap)
-        port = _reusable_port(rules, guest_ip)
-        if port is not None:
-            return port
+        for port, rule_guest in sorted(rules.items()):
+            if (
+                rule_guest == guest_ip
+                and PORT_RANGE_LOW <= port <= PORT_RANGE_HIGH
+            ):
+                return port
         return _alloc_and_dnat_locked(bitmap, guest_ip)
 
 
@@ -479,9 +453,7 @@ def release_port_and_dnat(bitmap: PortBitmap, host_port: int, guest_ip: str) -> 
 
     R5.3:release 后压 quarantine (PORT_QUARANTINE_SECONDS 冷却期),防迁移
     完成后端口立即复用把残留在途流量打到新租户。"""
-    global _rules_cache
     with _alloc_lock:
-        _rules_cache = None
         dnat_remove_all(host_port, guest_ip)
         bitmap.free(host_port)
     # 冷却期落盘在 alloc_lock 之外,避免文件 IO 挡住关键路径

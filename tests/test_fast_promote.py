@@ -830,25 +830,22 @@ _LINKS = """1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue state UNKNOWN
 _TAP7 = "8: tap-vm7: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc fq_codel state UP\n"
 
 
-@pytest.mark.parametrize("links, show_rc, awk_fails, purged", [
-    (_LINKS, 0, False, True),           # tap gone (tap-vm70 is another tap)
-    (_LINKS + _TAP7, 0, False, False),  # ip link del failed: the tap is still there
-    ("", 0, False, False),              # empty listing proves nothing
-    (_LINKS, 127, False, False),        # ip itself failed
-    (_LINKS + _TAP7, 0, True, False),   # the listing could not be parsed
-], ids=["tap_gone", "tap_left", "empty_listing", "ip_failed", "awk_failed"])
-def test_stop_purges_only_once_the_tap_is_gone(tmp_path, links, show_rc, awk_fails,
-                                               purged):
-    # A tap that survived `ip link del` is still up; purging its isolation DROPs
-    # would leave it reachable with no IMDS / east-west / management-port guard.
+def _teardown(tmp_path, links, show_rc=0, awk_fails=False, vm_json='{"vm_num": 7}'):
+    """Run stop-vm.sh's real teardown block for VM_NUM=7 against a stubbed ip."""
     src = (_USERDATA / "stop-vm.sh").read_text()
-    start = src.index('sudo ip link del "tap-vm${VM_NUM}"')
+    start = src.index("_own_vm_num=$(")
     block = src[start:src.index('rm -f "${VM_DIR}/fc.sock"', start)]
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
-    (tmp_path / "links").write_text(links)
+    vm_dir = tmp_path / "vm"
+    vm_dir.mkdir()
+    if vm_json is not None:
+        (vm_dir / "vm.json").write_text(vm_json)
     links_file = tmp_path / "links"
-    ip = (f'[ {show_rc} -ne 0 ] && exit {show_rc}\n'
+    links_file.write_text(links)
+    ip_log = tmp_path / "ip.log"
+    ip = (f'echo "$*" >> {ip_log}\n'
+          f'[ {show_rc} -ne 0 ] && exit {show_rc}\n'
           f'[ "$1 $2 $3" = "-o link show" ] && {{ cat {links_file}; exit 0; }}\n'
           f'[ "$1 $2" = "link show" ] && {{ grep -q " $3: " {links_file}; exit; }}\n'
           '[ "$1 $2" = "link del" ] && exit 1\n'
@@ -861,12 +858,42 @@ def test_stop_purges_only_once_the_tap_is_gone(tmp_path, links, show_rc, awk_fai
         (bin_dir / name).chmod(0o755)
     script = ('set -o pipefail\nlog() { echo "LOG $*"; }\n'
               'purge_tap_rules() { echo "PURGE $1"; }\n'
-              f"VM_NUM=7\n{block}")
+              f"VM_NUM=7\nVM_DIR={vm_dir}\n{block}")
     env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"}
     out = subprocess.run(["bash", "-c", script], env=env, capture_output=True,
                          text=True, check=True).stdout
+    return out, ip_log.read_text() if ip_log.exists() else ""
+
+
+@pytest.mark.parametrize("links, show_rc, awk_fails, purged", [
+    (_LINKS, 0, False, True),           # tap gone (tap-vm70 is another tap)
+    (_LINKS + _TAP7, 0, False, False),  # ip link del failed: the tap is still there
+    ("", 0, False, False),              # empty listing proves nothing
+    (_LINKS, 127, False, False),        # ip itself failed
+    (_LINKS + _TAP7, 0, True, False),   # the listing could not be parsed
+], ids=["tap_gone", "tap_left", "empty_listing", "ip_failed", "awk_failed"])
+def test_stop_purges_only_once_the_tap_is_gone(tmp_path, links, show_rc, awk_fails,
+                                               purged):
+    # A tap that survived `ip link del` is still up; purging its isolation DROPs
+    # would leave it reachable with no IMDS / east-west / management-port guard.
+    out, _ = _teardown(tmp_path, links, show_rc, awk_fails)
     if purged:
         assert out == "PURGE tap-vm7\n"
     else:
         assert "PURGE" not in out
         assert "WARN:" in out
+
+
+@pytest.mark.parametrize("vm_json", [
+    '{"vm_num": 17}',  # migrated: vm_num 7 is the target slot, the VM is on tap-vm17
+    None,              # no vm.json
+    "{not json",       # unreadable
+    '{"vm_num": "7"}', # not a number
+], ids=["other_tap", "no_vm_json", "bad_json", "not_int"])
+def test_stop_never_touches_a_tap_this_tenant_does_not_own(tmp_path, vm_json):
+    # tap-vm7 may be a live neighbour's: deleting it and purging its rules would cut
+    # that VM off and strip its isolation, and the post-delete check cannot tell.
+    out, ip_calls = _teardown(tmp_path, _LINKS + _TAP7, vm_json=vm_json)
+    assert "link del" not in ip_calls
+    assert "PURGE" not in out
+    assert "WARN:" in out and "leaving every tap" in out

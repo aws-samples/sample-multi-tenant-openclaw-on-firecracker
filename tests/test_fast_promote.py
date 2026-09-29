@@ -126,7 +126,7 @@ def env(tmp_path):
             BillingMode="PAY_PER_REQUEST",
         )
         for state in (agent._observed_status, agent._fast_retry_at,
-                      agent._tenant_write_locks, agent._phys_backfilled,
+                      agent._fast_backoff, agent._tenant_write_locks, agent._phys_backfilled,
                       agent._last_probe_at, agent._status):
             state.clear()
         agent._phys_backfilled.add("t-1")
@@ -289,6 +289,29 @@ def test_blocked_promote_backs_off_instead_of_writing_every_second(env):
     _put(env)  # guard cleared
     assert _fast({sock: 4242}) == 1
     assert _status(env) == "running"
+
+
+def test_new_vm_is_probed_every_tick_until_its_gateway_answers(env):
+    sock = _vm(env)
+    _put(env)
+    for _ in range(5):
+        assert _fast({sock: 4242}, gateway="down") == 0
+    assert "t-1" not in agent._fast_retry_at  # boot takes seconds; no added latency
+    assert _fast({sock: 4242}) == 1
+
+
+def test_vm_whose_gateway_never_answers_is_backed_off(env):
+    sock = _vm(env, age=agent.FAST_PROMOTE_GRACE_SEC + 1)
+    _put(env)
+    delays = []
+    for _ in range(6):
+        assert _fast({sock: 4242}, gateway="down") == 0
+        delays.append(round(agent._fast_retry_at["t-1"] - time.monotonic()))
+        assert _fast({sock: 4242}, gateway="down") == 0  # skipped: not probed again
+        agent._fast_retry_at["t-1"] = 0  # the delay has passed
+    assert delays == [5, 10, 20, 40, 60, 60]
+    assert _fast({sock: 4242}) == 1  # the poll pass would have promoted it too
+    assert "t-1" not in agent._fast_backoff
 
 
 @pytest.mark.parametrize("item", [None, {"host_id": "i-other"}, {"vm_num": 2}])

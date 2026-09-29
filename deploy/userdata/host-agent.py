@@ -48,6 +48,15 @@ FAST_PROMOTE_WINDOW_SEC = int(os.environ.get("OC_AGENT_FAST_PROMOTE_WINDOW_SEC",
 # After an attempt that did not promote (CAS guard still blocking), wait this long
 # before trying the same tenant again.
 FAST_PROMOTE_RETRY_SEC = float(os.environ.get("OC_AGENT_FAST_PROMOTE_RETRY_SEC", "5"))
+# A candidate whose gateway has not answered is probed every tick for this long after
+# its vm.json was written (gateways answer within seconds of boot), then backed off
+# exponentially from FAST_PROMOTE_RETRY_SEC up to FAST_PROMOTE_BACKOFF_MAX_SEC, so VMs
+# whose gateway never comes up do not keep the probe workers from new ones. The poll
+# pass still promotes a late one.
+FAST_PROMOTE_GRACE_SEC = float(os.environ.get("OC_AGENT_FAST_PROMOTE_GRACE_SEC", "60"))
+FAST_PROMOTE_BACKOFF_MAX_SEC = float(
+    os.environ.get("OC_AGENT_FAST_PROMOTE_BACKOFF_MAX_SEC", "60")
+)
 FAST_PROMOTE_PARALLEL = int(os.environ.get("OC_AGENT_FAST_PROMOTE_PARALLEL", "8"))
 # Gateway check timeout on the fast path. A gateway slower than this is left to the
 # next fast tick or the poll pass instead of holding a probe worker for 8 s.
@@ -483,6 +492,7 @@ _observed_status = {}
 _tenant_write_locks = {}
 _tenant_write_locks_guard = threading.Lock()
 _fast_retry_at = {}  # tenant_id -> monotonic time before which the fast loop skips it
+_fast_backoff = {}  # tenant_id -> last back-off delay after a probe found it not ready
 # Monotonic start time of the newest probe written per tenant. The two loops probe
 # independently, so a poll result taken before a fast-promote write can reach the
 # lock after it; _write_tenant drops such an older result instead of writing it.
@@ -5217,10 +5227,30 @@ def _fast_promote_drain(inflight, timeout):
             info = fut.result()
         except Exception as e:
             print(f"fast probe {tid}: {e}")
+            info = None
+        if info is None:
+            _fast_back_off(tid)
             continue
-        if info is not None and _fast_promote_write(tid, info):
+        _fast_backoff.pop(tid, None)
+        if _fast_promote_write(tid, info):
             written += 1
     return written
+
+
+def _fast_back_off(tid):
+    """Delay the next probe of a candidate that is not ready, once past the grace."""
+    try:
+        mtime = os.stat(os.path.join(VM_DIR, tid, "vm.json")).st_mtime
+    except OSError:
+        return
+    if time.time() - mtime < FAST_PROMOTE_GRACE_SEC:
+        return
+    delay = min(
+        _fast_backoff.get(tid, FAST_PROMOTE_RETRY_SEC / 2) * 2,
+        FAST_PROMOTE_BACKOFF_MAX_SEC,
+    )
+    _fast_backoff[tid] = delay
+    _fast_retry_at[tid] = time.monotonic() + delay
 
 
 def _fast_promote_loop():

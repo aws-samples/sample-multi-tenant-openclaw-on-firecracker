@@ -1932,12 +1932,16 @@ def _write_older_metrics(table, tid, info, via):
         table.update_item(
             Key={"id": tid},
             UpdateExpression="SET #m = :m",
-            ConditionExpression="attribute_exists(id) AND host_id = :self",
-            ExpressionAttributeNames={"#m": "metrics"},
-            ExpressionAttributeValues={":m": metrics, ":self": INSTANCE_ID},
+            # Stricter than the health write: this result was dropped before, so it
+            # must not start refreshing a soft-deleted record that keeps host_id.
+            ConditionExpression="attribute_exists(id) AND host_id = :self AND #s <> :d",
+            ExpressionAttributeNames={"#m": "metrics", "#s": "status"},
+            ExpressionAttributeValues={
+                ":m": metrics, ":self": INSTANCE_ID, ":d": "deleted"
+            },
         )
     except table.meta.client.exceptions.ConditionalCheckFailedException:
-        pass  # deleted or owned by another host
+        pass  # gone, deleted or owned by another host
     except Exception as e:
         print(f"ddb metrics update {tid}: {e}")
 

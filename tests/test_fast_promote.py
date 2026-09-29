@@ -556,6 +556,20 @@ def test_blocked_tenant_still_gets_poll_metrics(env):
     assert agent._status["t-1"]["metrics"] == {"cpu_pct": 0}
 
 
+@pytest.mark.parametrize("item", [None, {"host_id": "i-other"}, {"status": "deleted"}],
+                         ids=["no_record", "other_host", "deleted"])
+def test_older_poll_metrics_never_reach_a_record_this_host_does_not_own(env, item):
+    _vm(env)
+    if item is not None:
+        _put(env, metrics={"cpu_pct": 123}, **item)
+    agent._last_probe_at["t-1"] = 12.0
+    agent._write_ddb({"t-1": {"vm_health": "up", "app_health": "up",
+                              "guest_ip": "172.16.0.2", "phys_vm_num": 1,
+                              "fc_pid": 4242, "probed_at": 10.0}})
+    got = env.table.get_item(Key={"id": "t-1"}).get("Item")
+    assert got is None if item is None else got["metrics"] == {"cpu_pct": 123}
+
+
 def test_older_poll_result_does_not_regress_a_running_tenants_health(env):
     # After an agent restart _observed_status is empty, so a recently created
     # tenant that is already running is a fast candidate again. Its fast write

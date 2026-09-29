@@ -363,6 +363,22 @@ def test_restarted_firecracker_gets_a_fresh_grace(env):
     assert _fast({sock: 4242}) == 1
 
 
+def test_poll_clearing_the_back_off_mid_candidate_scan_is_harmless(env):
+    sock = _vm(env, age=agent.FAST_PROMOTE_GRACE_SEC + 1)
+    _started(env, age=agent.FAST_PROMOTE_GRACE_SEC + 1)
+    _put(env)
+    assert _fast({sock: 4242}, gateway="down") == 0
+    backed_off_for = agent._fast_backoff_fc["t-1"]
+
+    def poll_clears_meanwhile(vm_path):  # the poll thread runs _clear_fast_back_off here
+        agent._clear_fast_back_off("t-1")
+        return backed_off_for
+
+    with patch.object(agent, "_fc_sock_id", side_effect=poll_clears_meanwhile):
+        assert agent._fast_promote_candidates(time.time()) == []
+    assert agent._fast_promote_candidates(time.time()) == ["t-1"]
+
+
 def test_leftover_fc_sock_without_firecracker_is_not_backed_off(env):
     sock = _vm(env, age=agent.FAST_PROMOTE_GRACE_SEC + 60)
     _started(env, age=agent.FAST_PROMOTE_GRACE_SEC + 60)  # left by an earlier run

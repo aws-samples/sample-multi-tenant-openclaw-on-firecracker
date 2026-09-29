@@ -5176,7 +5176,9 @@ def _fast_promote_candidates(now_epoch):
             continue
         vm_path = os.path.join(VM_DIR, tid)
         if mono < _fast_retry_at.get(tid, 0):
-            if tid not in _fast_backoff_fc or _fc_sock_id(vm_path) == _fast_backoff_fc[tid]:
+            # One read: the poll thread may clear the back-off between two.
+            backed_off_for = _fast_backoff_fc.get(tid)
+            if backed_off_for is None or _fc_sock_id(vm_path) == backed_off_for:
                 continue
             _clear_fast_back_off(tid)  # a new Firecracker: its own grace, from now
         try:

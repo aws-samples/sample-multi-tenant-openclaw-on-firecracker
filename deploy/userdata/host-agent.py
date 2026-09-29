@@ -486,6 +486,9 @@ _fast_retry_at = {}  # tenant_id -> monotonic time before which the fast loop sk
 # Monotonic start time of the newest probe written per tenant. The two loops probe
 # independently, so a poll result taken before a fast-promote write can reach the
 # lock after it; _write_tenant drops such an older result instead of writing it.
+# A fast write counts only if it promoted: one held back by a CAS guard is retried
+# every FAST_PROMOTE_RETRY_SEC, and counting it would drop every poll result (and
+# its metrics) for that tenant.
 _last_probe_at = {}
 
 
@@ -1840,13 +1843,15 @@ def _write_tenant(table, tid, info, now, via="poll"):
 
     Caller holds _tenant_write_lock(tid). Records the status the health write
     observed in _observed_status for the fast-promote loop. A result whose probe
-    started before the last one written for this tenant is dropped.
+    started before the last one written for this tenant is dropped. Returns True
+    if this write promoted the tenant.
     """
     probed_at = info.get("probed_at")
     if probed_at is not None:
         if probed_at < _last_probe_at.get(tid, probed_at):
-            return
-        _last_probe_at[tid] = probed_at
+            return False
+        if via != "fast":
+            _last_probe_at[tid] = probed_at
     # 撞号检查(create + migrate)对它们会退回 vm_num,迁移过的会有短暂盲区。这里用 vm.json
     # 里的物理 vm_num 补齐,if_not_exists 保证只写一次、绝不覆盖(create 已写的、或先前
     # 回填的都不动)——迁移把 vm_num 翻成 target 槽时 phys_vm_num 恒定,靠的正是"绝不覆盖"。
@@ -2015,11 +2020,14 @@ def _write_tenant(table, tid, info, now, via="poll"):
                     ExpressionAttributeValues=update_vals,
                 )
                 _observed_status[tid] = "running"
+                if probed_at is not None:
+                    _last_probe_at[tid] = probed_at
                 print(
                     f"promoted {tid} creating → running "
                     f"(host={host_private_ip}:{host_port} guest={info['guest_ip']}"
                     f" via={via})"
                 )
+                return True
             except table.meta.client.exceptions.ConditionalCheckFailedException:
                 # Health was already refreshed. The status/owner may have
                 # changed since that write, or vm_num/dispatch_settle may still
@@ -5181,15 +5189,19 @@ def _fast_promote_write(tid, info):
         return False  # the poll loop is writing this tenant right now
     now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     try:
-        _write_tenant(_get_ddb().Table(TENANTS_TABLE), tid, info, now, via="fast")
+        promoted = _write_tenant(
+            _get_ddb().Table(TENANTS_TABLE), tid, info, now, via="fast"
+        )
     finally:
         lk.release()
     if _observed_status.get(tid, "creating") == "creating":
         # Healthy but not promoted: a CAS guard (vm_num, dispatch_settle) or a
         # route failure is still blocking. Do not rewrite it every second.
         _fast_retry_at[tid] = time.monotonic() + FAST_PROMOTE_RETRY_SEC
-    with _lock:
-        _status[tid] = _newer_status(_status.get(tid), {**info, "updated_at": now})
+    if promoted:
+        # Otherwise the poll pass's entry, which carries the metrics, stays.
+        with _lock:
+            _status[tid] = _newer_status(_status.get(tid), {**info, "updated_at": now})
     return True
 
 

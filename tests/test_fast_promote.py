@@ -426,6 +426,23 @@ def test_poll_result_probed_before_a_fast_write_is_dropped(env):
     assert env.table.get_item(Key={"id": "t-1"})["Item"]["app_health"] == "down"
 
 
+def test_blocked_tenant_still_gets_poll_metrics(env):
+    # A CAS guard holds the tenant in creating, so the fast loop rewrites it every
+    # FAST_PROMOTE_RETRY_SEC. Those writes promote nothing and must not make every
+    # poll result (probed earlier in a longer pass) look stale.
+    sock = _vm(env)
+    _put(env, dispatch_settle="in-flight")
+    before = time.monotonic()
+    assert _fast({sock: 4242}) == 1
+    assert _status(env) == "creating"
+    assert "t-1" not in agent._status  # the fast write promoted nothing
+    agent._write_ddb({"t-1": {"vm_health": "up", "app_health": "up",
+                              "guest_ip": "172.16.0.2", "phys_vm_num": 1,
+                              "fc_pid": 4242, "probed_at": before}})
+    item = env.table.get_item(Key={"id": "t-1"})["Item"]
+    assert (item["status"], item["metrics"]) == ("creating", {"cpu_pct": 0})
+
+
 def test_metrics_snapshot_keeps_the_newer_probe():
     fast = {"app_health": "up", "probed_at": 2.0}
     assert agent._newer_status(fast, {"app_health": "down", "probed_at": 1.0}) is fast

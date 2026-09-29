@@ -401,14 +401,19 @@ sudo ip link del "tap-vm${VM_NUM}" 2>/dev/null || true
 # Only once the tap is known to be gone: purging the isolation DROPs of a tap that is
 # still up would leave it half-isolated. `ip link show <tap>` failing does not prove
 # that (ip itself may fail), so list every link and look for the tap in the list.
-if ! _links=$(sudo ip -o link show 2>/dev/null) || [ -z "${_links}" ]; then
-  log "WARN: cannot list network links; keeping tap-vm${VM_NUM} iptables rules"
-elif printf '%s\n' "${_links}" | awk -F': ' -v tap="tap-vm${VM_NUM}" \
-    '{ name = $2; sub(/@.*/, "", name); if (name == tap) found = 1 } END { exit !found }'; then
-  log "WARN: tap-vm${VM_NUM} still exists after ip link del; keeping its iptables rules"
-else
-  purge_tap_rules "tap-vm${VM_NUM}"
+# Only a listing and a parse that both succeed and say "absent" purge; anything else
+# (ip or awk failing, an empty listing) keeps the rules.
+_tap_state=unknown
+if _links=$(sudo ip -o link show 2>/dev/null) && [ -n "${_links}" ]; then
+  _tap_state=$(awk -F': ' -v tap="tap-vm${VM_NUM}" \
+    '{ name = $2; sub(/@.*/, "", name); if (name == tap) found = 1 }
+     END { print (found ? "present" : "absent") }' <<<"${_links}") || _tap_state=unknown
 fi
+case "${_tap_state}" in
+  absent) purge_tap_rules "tap-vm${VM_NUM}" ;;
+  present) log "WARN: tap-vm${VM_NUM} still exists after ip link del; keeping its iptables rules" ;;
+  *) log "WARN: cannot tell whether tap-vm${VM_NUM} is gone; keeping its iptables rules" ;;
+esac
 rm -f "${VM_DIR}/fc.sock" "${VM_DIR}/fc.log"
 sudo rm -f "/etc/nginx/conf.d/tenants/${TENANT_ID}.conf"
 sudo nginx -s reload 2>/dev/null || true

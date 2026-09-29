@@ -767,13 +767,15 @@ _LINKS = """1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue state UNKNOWN
 _TAP7 = "8: tap-vm7: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc fq_codel state UP\n"
 
 
-@pytest.mark.parametrize("links, show_rc, purged", [
-    (_LINKS, 0, True),           # tap gone (tap-vm70 is another tap)
-    (_LINKS + _TAP7, 0, False),  # ip link del failed: the tap is still there
-    ("", 0, False),              # empty listing proves nothing
-    (_LINKS, 127, False),        # ip itself failed
-], ids=["tap_gone", "tap_left", "empty_listing", "ip_failed"])
-def test_stop_purges_only_once_the_tap_is_gone(tmp_path, links, show_rc, purged):
+@pytest.mark.parametrize("links, show_rc, awk_fails, purged", [
+    (_LINKS, 0, False, True),           # tap gone (tap-vm70 is another tap)
+    (_LINKS + _TAP7, 0, False, False),  # ip link del failed: the tap is still there
+    ("", 0, False, False),              # empty listing proves nothing
+    (_LINKS, 127, False, False),        # ip itself failed
+    (_LINKS + _TAP7, 0, True, False),   # the listing could not be parsed
+], ids=["tap_gone", "tap_left", "empty_listing", "ip_failed", "awk_failed"])
+def test_stop_purges_only_once_the_tap_is_gone(tmp_path, links, show_rc, awk_fails,
+                                               purged):
     # A tap that survived `ip link del` is still up; purging its isolation DROPs
     # would leave it reachable with no IMDS / east-west / management-port guard.
     src = (_USERDATA / "stop-vm.sh").read_text()
@@ -788,7 +790,10 @@ def test_stop_purges_only_once_the_tap_is_gone(tmp_path, links, show_rc, purged)
           f'[ "$1 $2" = "link show" ] && {{ grep -q " $3: " {links_file}; exit; }}\n'
           '[ "$1 $2" = "link del" ] && exit 1\n'
           'exit 2')
-    for name, code in {"sudo": 'exec "$@"', "ip": ip}.items():
+    stubs = {"sudo": 'exec "$@"', "ip": ip}
+    if awk_fails:
+        stubs["awk"] = "exit 2"
+    for name, code in stubs.items():
         (bin_dir / name).write_text(f"#!/bin/bash\n{code}\n")
         (bin_dir / name).chmod(0o755)
     script = ('set -o pipefail\nlog() { echo "LOG $*"; }\n'

@@ -734,8 +734,20 @@ def test_stop_falls_back_to_one_rule_at_a_time(tmp_path):
     assert "WARN: 4 iptables rules for tap-vm7 survived cleanup" in out
 
 
-@pytest.mark.parametrize("tap_left", [False, True])
-def test_stop_purges_only_once_the_tap_is_gone(tmp_path, tap_left):
+_LINKS = """1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue state UNKNOWN
+2: ens5: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 9001 qdisc mq state UP
+9: tap-vm70: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc fq_codel state UP
+"""
+_TAP7 = "8: tap-vm7: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc fq_codel state UP\n"
+
+
+@pytest.mark.parametrize("links, show_rc, purged", [
+    (_LINKS, 0, True),           # tap gone (tap-vm70 is another tap)
+    (_LINKS + _TAP7, 0, False),  # ip link del failed: the tap is still there
+    ("", 0, False),              # empty listing proves nothing
+    (_LINKS, 127, False),        # ip itself failed
+], ids=["tap_gone", "tap_left", "empty_listing", "ip_failed"])
+def test_stop_purges_only_once_the_tap_is_gone(tmp_path, links, show_rc, purged):
     # A tap that survived `ip link del` is still up; purging its isolation DROPs
     # would leave it reachable with no IMDS / east-west / management-port guard.
     src = (_USERDATA / "stop-vm.sh").read_text()
@@ -743,18 +755,24 @@ def test_stop_purges_only_once_the_tap_is_gone(tmp_path, tap_left):
     block = src[start:src.index('rm -f "${VM_DIR}/fc.sock"', start)]
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
-    for name, code in {"sudo": 'exec "$@"',
-                       "ip": f'[ "$2" = show ] && exit {0 if tap_left else 1}; exit 0'}.items():
+    (tmp_path / "links").write_text(links)
+    links_file = tmp_path / "links"
+    ip = (f'[ {show_rc} -ne 0 ] && exit {show_rc}\n'
+          f'[ "$1 $2 $3" = "-o link show" ] && {{ cat {links_file}; exit 0; }}\n'
+          f'[ "$1 $2" = "link show" ] && {{ grep -q " $3: " {links_file}; exit; }}\n'
+          '[ "$1 $2" = "link del" ] && exit 1\n'
+          'exit 2')
+    for name, code in {"sudo": 'exec "$@"', "ip": ip}.items():
         (bin_dir / name).write_text(f"#!/bin/bash\n{code}\n")
         (bin_dir / name).chmod(0o755)
-    script = ('log() { echo "LOG $*"; }\n'
+    script = ('set -o pipefail\nlog() { echo "LOG $*"; }\n'
               'purge_tap_rules() { echo "PURGE $1"; }\n'
               f"VM_NUM=7\n{block}")
     env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"}
     out = subprocess.run(["bash", "-c", script], env=env, capture_output=True,
                          text=True, check=True).stdout
-    if tap_left:
-        assert "PURGE" not in out
-        assert "WARN: tap-vm7 still exists" in out
-    else:
+    if purged:
         assert out == "PURGE tap-vm7\n"
+    else:
+        assert "PURGE" not in out
+        assert "WARN:" in out

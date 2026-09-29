@@ -398,9 +398,13 @@ if [ "${LEGACY_FIRECRACKER_TERMINATED}" -eq 0 ]; then
 fi
 # 4) Clean up the host-side network + sockets + nginx route.
 sudo ip link del "tap-vm${VM_NUM}" 2>/dev/null || true
-# Only once the tap is gone: purging the isolation DROPs of a tap that is still up
-# would leave it half-isolated.
-if ip link show "tap-vm${VM_NUM}" >/dev/null 2>&1; then
+# Only once the tap is known to be gone: purging the isolation DROPs of a tap that is
+# still up would leave it half-isolated. `ip link show <tap>` failing does not prove
+# that (ip itself may fail), so list every link and look for the tap in the list.
+if ! _links=$(sudo ip -o link show 2>/dev/null) || [ -z "${_links}" ]; then
+  log "WARN: cannot list network links; keeping tap-vm${VM_NUM} iptables rules"
+elif printf '%s\n' "${_links}" | awk -F': ' -v tap="tap-vm${VM_NUM}" \
+    '{ name = $2; sub(/@.*/, "", name); if (name == tap) found = 1 } END { exit !found }'; then
   log "WARN: tap-vm${VM_NUM} still exists after ip link del; keeping its iptables rules"
 else
   purge_tap_rules "tap-vm${VM_NUM}"

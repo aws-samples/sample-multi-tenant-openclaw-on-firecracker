@@ -398,7 +398,13 @@ if [ "${LEGACY_FIRECRACKER_TERMINATED}" -eq 0 ]; then
 fi
 # 4) Clean up the host-side network + sockets + nginx route.
 sudo ip link del "tap-vm${VM_NUM}" 2>/dev/null || true
-purge_tap_rules "tap-vm${VM_NUM}"
+# Only once the tap is gone: purging the isolation DROPs of a tap that is still up
+# would leave it half-isolated.
+if ip link show "tap-vm${VM_NUM}" >/dev/null 2>&1; then
+  log "WARN: tap-vm${VM_NUM} still exists after ip link del; keeping its iptables rules"
+else
+  purge_tap_rules "tap-vm${VM_NUM}"
+fi
 rm -f "${VM_DIR}/fc.sock" "${VM_DIR}/fc.log"
 sudo rm -f "/etc/nginx/conf.d/tenants/${TENANT_ID}.conf"
 sudo nginx -s reload 2>/dev/null || true

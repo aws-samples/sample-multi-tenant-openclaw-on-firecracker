@@ -645,3 +645,29 @@ def test_stop_falls_back_to_one_rule_at_a_time(tmp_path):
     ]
     # The stubs never really delete, so the survivor check must say so.
     assert "WARN: 4 iptables rules for tap-vm7 survived cleanup" in out
+
+
+@pytest.mark.parametrize("tap_left", [False, True])
+def test_stop_purges_only_once_the_tap_is_gone(tmp_path, tap_left):
+    # A tap that survived `ip link del` is still up; purging its isolation DROPs
+    # would leave it reachable with no IMDS / east-west / management-port guard.
+    src = (_USERDATA / "stop-vm.sh").read_text()
+    start = src.index('sudo ip link del "tap-vm${VM_NUM}"')
+    block = src[start:src.index('rm -f "${VM_DIR}/fc.sock"', start)]
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    for name, code in {"sudo": 'exec "$@"',
+                       "ip": f'[ "$2" = show ] && exit {0 if tap_left else 1}; exit 0'}.items():
+        (bin_dir / name).write_text(f"#!/bin/bash\n{code}\n")
+        (bin_dir / name).chmod(0o755)
+    script = ('log() { echo "LOG $*"; }\n'
+              'purge_tap_rules() { echo "PURGE $1"; }\n'
+              f"VM_NUM=7\n{block}")
+    env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"}
+    out = subprocess.run(["bash", "-c", script], env=env, capture_output=True,
+                         text=True, check=True).stdout
+    if tap_left:
+        assert "PURGE" not in out
+        assert "WARN: tap-vm7 still exists" in out
+    else:
+        assert out == "PURGE tap-vm7\n"

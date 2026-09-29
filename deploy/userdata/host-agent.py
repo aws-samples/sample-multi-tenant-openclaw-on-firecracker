@@ -510,13 +510,28 @@ def _tenant_write_lock(tid):
         return lk
 
 
+def _acquire_tenant_write_lock(tid, blocking=True):
+    """Acquire the tenant's write lock; None if not blocking and it is held.
+
+    _prune_tenant_state may drop the lock between the lookup and the acquire;
+    holding a dropped lock would let a second writer create and take a new one.
+    """
+    while True:
+        lk = _tenant_write_lock(tid)
+        if not lk.acquire(blocking=blocking):
+            return None
+        with _tenant_write_locks_guard:
+            if _tenant_write_locks.get(tid) is lk:
+                return lk  # held, so prune leaves it alone from here
+        lk.release()
+
+
 def _prune_tenant_state(live_tids):
     """Forget per-tenant fast-path state for tenants no longer on this host."""
-    for tid in list(_observed_status):
-        if tid not in live_tids:
-            _observed_status.pop(tid, None)
-            _fast_retry_at.pop(tid, None)
-            _last_probe_at.pop(tid, None)
+    state = (_observed_status, _fast_retry_at, _fast_backoff, _last_probe_at)
+    for tid in set().union(*state) - set(live_tids):
+        for d in state:
+            d.pop(tid, None)
     with _tenant_write_locks_guard:
         for tid in list(_tenant_write_locks):
             if tid not in live_tids and not _tenant_write_locks[tid].locked():
@@ -1826,8 +1841,11 @@ def _write_ddb(results):
     table = _get_ddb().Table(TENANTS_TABLE)
     now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     for tid, info in results.items():
-        with _tenant_write_lock(tid):
+        lk = _acquire_tenant_write_lock(tid)
+        try:
             _write_tenant(table, tid, info, now)
+        finally:
+            lk.release()
 
 
 def _write_route(tid, info):
@@ -5194,8 +5212,8 @@ def _fast_promote_submit(pool, inflight):
 
 def _fast_promote_write(tid, info):
     """Promote one ready tenant unless the poll loop is writing it. True if written."""
-    lk = _tenant_write_lock(tid)
-    if not lk.acquire(blocking=False):
+    lk = _acquire_tenant_write_lock(tid, blocking=False)
+    if lk is None:
         return False  # the poll loop is writing this tenant right now
     now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     try:

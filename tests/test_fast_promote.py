@@ -347,6 +347,8 @@ def test_prune_forgets_tenants_that_left_the_host():
     agent._observed_status.update({"gone": "running", "here": "creating"})
     agent._fast_retry_at["gone"] = 1
     agent._last_probe_at["gone"] = 1.0
+    agent._last_probe_at["never-observed"] = 1.0  # route failed before any status
+    agent._fast_backoff["gone"] = 5
     agent._tenant_write_lock("gone")
     held = agent._tenant_write_lock("held")
     with held:
@@ -357,6 +359,29 @@ def test_prune_forgets_tenants_that_left_the_host():
     assert "gone" not in agent._tenant_write_locks
     assert agent._tenant_write_locks.get("held") is held  # never drop a held lock
     assert agent._observed_status["here"] == "creating"
+    assert "never-observed" not in agent._last_probe_at
+    assert "gone" not in agent._fast_backoff
+
+
+def test_prune_between_lookup_and_acquire_does_not_split_the_lock():
+    agent._tenant_write_locks.clear()
+    lookup = agent._tenant_write_lock
+    pruned = []
+
+    def lookup_then_prune(tid):
+        lk = lookup(tid)
+        if not pruned:  # the poll pass prunes before this writer acquires
+            pruned.append(1)
+            agent._prune_tenant_state(set())
+        return lk
+
+    with patch.object(agent, "_tenant_write_lock", side_effect=lookup_then_prune):
+        first = agent._acquire_tenant_write_lock("A", blocking=False)
+    try:
+        assert first is agent._tenant_write_locks["A"]
+        assert agent._acquire_tenant_write_lock("A", blocking=False) is None
+    finally:
+        first.release()
 
 
 # ─── routes always check the live DNAT rules ────────────────────

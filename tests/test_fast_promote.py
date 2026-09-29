@@ -159,6 +159,14 @@ def _vm(env, tid="t-1", age=0, stopped=False, vm_num=1):
     return f"{vm}/fc.sock"
 
 
+def _started(env, tid="t-1", age=0):
+    """Firecracker has started for tid: it created fc.sock `age` seconds ago."""
+    sock = env.dir / tid / "fc.sock"
+    sock.touch()
+    t = time.time() - age
+    os.utime(sock, (t, t))
+
+
 def _put(env, tid="t-1", status="creating", **overrides):
     env.table.put_item(Item={
         "id": tid, "status": status, "host_id": "i-test", "vm_num": 1,
@@ -291,8 +299,13 @@ def test_blocked_promote_backs_off_instead_of_writing_every_second(env):
     assert _status(env) == "running"
 
 
-def test_new_vm_is_probed_every_tick_until_its_gateway_answers(env):
-    sock = _vm(env)
+@pytest.mark.parametrize("fc_age", [0, None], ids=["fc_just_started", "fc_not_started"])
+def test_new_vm_is_probed_every_tick_until_its_gateway_answers(env, fc_age):
+    # vm.json is written before the download / restore; the grace runs from
+    # Firecracker's start instead.
+    sock = _vm(env, age=agent.FAST_PROMOTE_GRACE_SEC + 60)
+    if fc_age is not None:
+        _started(env, age=fc_age)
     _put(env)
     for _ in range(5):
         assert _fast({sock: 4242}, gateway="down") == 0
@@ -302,6 +315,7 @@ def test_new_vm_is_probed_every_tick_until_its_gateway_answers(env):
 
 def test_vm_whose_gateway_never_answers_is_backed_off(env):
     sock = _vm(env, age=agent.FAST_PROMOTE_GRACE_SEC + 1)
+    _started(env, age=agent.FAST_PROMOTE_GRACE_SEC + 1)
     _put(env)
     delays = []
     for _ in range(6):
@@ -313,6 +327,18 @@ def test_vm_whose_gateway_never_answers_is_backed_off(env):
     assert _fast({sock: 4242}) == 1  # the poll pass would have promoted it too
     assert "t-1" not in agent._fast_backoff
 
+
+def test_poll_promote_clears_the_fast_back_off(env):
+    sock = _vm(env, age=agent.FAST_PROMOTE_GRACE_SEC + 1)
+    _started(env, age=agent.FAST_PROMOTE_GRACE_SEC + 1)
+    _put(env)
+    assert _fast({sock: 4242}, gateway="down") == 0
+    assert "t-1" in agent._fast_backoff
+    agent._write_ddb({"t-1": {"vm_health": "up", "app_health": "up",
+                              "guest_ip": "172.16.0.2", "phys_vm_num": 1,
+                              "fc_pid": 4242, "probed_at": time.monotonic()}})
+    assert _status(env) == "running"
+    assert "t-1" not in agent._fast_backoff
 
 
 @pytest.mark.parametrize("item", [None, {"host_id": "i-other"}, {"vm_num": 2}])

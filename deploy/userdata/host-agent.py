@@ -49,7 +49,7 @@ FAST_PROMOTE_WINDOW_SEC = int(os.environ.get("OC_AGENT_FAST_PROMOTE_WINDOW_SEC",
 # before trying the same tenant again.
 FAST_PROMOTE_RETRY_SEC = float(os.environ.get("OC_AGENT_FAST_PROMOTE_RETRY_SEC", "5"))
 # A candidate whose gateway has not answered is probed every tick for this long after
-# its vm.json was written (gateways answer within seconds of boot), then backed off
+# its Firecracker started (gateways answer within seconds of boot), then backed off
 # exponentially from FAST_PROMOTE_RETRY_SEC up to FAST_PROMOTE_BACKOFF_MAX_SEC, so VMs
 # whose gateway never comes up do not keep the probe workers from new ones. The poll
 # pass still promotes a late one.
@@ -1847,6 +1847,10 @@ def _write_ddb(results):
             _write_tenant(table, tid, info, now)
         finally:
             lk.release()
+        if _observed_status.get(tid) != "creating":
+            # Promoted here or no longer a candidate: a later rollback to creating
+            # starts the fast probes afresh.
+            _fast_backoff.pop(tid, None)
 
 
 def _write_route(tid, info):
@@ -5290,12 +5294,17 @@ def _fast_promote_drain(inflight, timeout):
 
 
 def _fast_back_off(tid):
-    """Delay the next probe of a candidate that is not ready, once past the grace."""
+    """Delay the next probe of a candidate that is not ready, once past the grace.
+
+    The grace runs from Firecracker's start (it creates fc.sock), not from vm.json:
+    launch writes vm.json before a download or restore that can outlast the grace.
+    Until Firecracker starts, a probe returns before pinging, so it is not delayed.
+    """
     try:
-        mtime = os.stat(os.path.join(VM_DIR, tid, "vm.json")).st_mtime
+        started = os.stat(os.path.join(VM_DIR, tid, "fc.sock")).st_mtime
     except OSError:
         return
-    if time.time() - mtime < FAST_PROMOTE_GRACE_SEC:
+    if time.time() - started < FAST_PROMOTE_GRACE_SEC:
         return
     delay = min(
         _fast_backoff.get(tid, FAST_PROMOTE_RETRY_SEC / 2) * 2,

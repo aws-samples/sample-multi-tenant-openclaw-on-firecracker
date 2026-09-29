@@ -126,7 +126,8 @@ def env(tmp_path):
             BillingMode="PAY_PER_REQUEST",
         )
         for state in (agent._observed_status, agent._fast_retry_at,
-                      agent._fast_backoff, agent._tenant_write_locks, agent._phys_backfilled,
+                      agent._fast_backoff, agent._fast_backoff_fc,
+                      agent._tenant_write_locks, agent._phys_backfilled,
                       agent._last_probe_at, agent._status):
             state.clear()
         agent._phys_backfilled.add("t-1")
@@ -339,6 +340,37 @@ def test_poll_promote_clears_the_fast_back_off(env):
                               "fc_pid": 4242, "probed_at": time.monotonic()}})
     assert _status(env) == "running"
     assert "t-1" not in agent._fast_backoff
+    _put(env)  # rolled back to creating
+    agent._write_ddb({"t-1": {"vm_health": "up", "app_health": "down",
+                              "guest_ip": "172.16.0.2", "phys_vm_num": 1,
+                              "fc_pid": 4242, "probed_at": time.monotonic()}})
+    assert agent._observed_status["t-1"] == "creating"
+    assert agent._fast_promote_candidates(time.time()) == ["t-1"]
+
+
+def test_restarted_firecracker_gets_a_fresh_grace(env):
+    sock = _vm(env, age=agent.FAST_PROMOTE_GRACE_SEC + 1)
+    _started(env, age=agent.FAST_PROMOTE_GRACE_SEC + 1)
+    _put(env)
+    assert _fast({sock: 4242}, gateway="down") == 0
+    assert agent._fast_promote_candidates(time.time()) == []  # backed off
+    os.remove(sock)
+    _started(env)  # Firecracker restarted: a new fc.sock
+    assert agent._fast_promote_candidates(time.time()) == ["t-1"]
+    for _ in range(3):
+        assert _fast({sock: 4242}, gateway="down") == 0
+    assert "t-1" not in agent._fast_retry_at  # inside the new grace
+    assert _fast({sock: 4242}) == 1
+
+
+def test_leftover_fc_sock_without_firecracker_is_not_backed_off(env):
+    sock = _vm(env, age=agent.FAST_PROMOTE_GRACE_SEC + 60)
+    _started(env, age=agent.FAST_PROMOTE_GRACE_SEC + 60)  # left by an earlier run
+    _put(env)
+    for _ in range(3):
+        assert _fast({}) == 0  # no Firecracker process yet
+    assert "t-1" not in agent._fast_retry_at
+    assert _fast({sock: 4242}) == 1
 
 
 @pytest.mark.parametrize("item", [None, {"host_id": "i-other"}, {"vm_num": 2}])
@@ -376,6 +408,7 @@ def test_prune_forgets_tenants_that_left_the_host():
     agent._last_probe_at["gone"] = 1.0
     agent._last_probe_at["never-observed"] = 1.0  # route failed before any status
     agent._fast_backoff["gone"] = 5
+    agent._fast_backoff_fc["gone"] = (1, 1)
     agent._tenant_write_lock("gone")
     held = agent._tenant_write_lock("held")
     with held:
@@ -388,6 +421,7 @@ def test_prune_forgets_tenants_that_left_the_host():
     assert agent._observed_status["here"] == "creating"
     assert "never-observed" not in agent._last_probe_at
     assert "gone" not in agent._fast_backoff
+    assert "gone" not in agent._fast_backoff_fc
 
 
 def test_prune_between_lookup_and_acquire_does_not_split_the_lock():
@@ -434,8 +468,7 @@ def nat():
 
 
 def test_ready_tenant_is_written_while_another_probe_is_still_running(env):
-    _vm(env)
-    _vm(env, tid="slow")
+    pids = {_vm(env): 4242, _vm(env, tid="slow"): 4243}
     _put(env)
     ready = {"vm_health": "up", "app_health": "up", "guest_ip": "172.16.0.2",
              "phys_vm_num": 1, "fc_pid": 4242, "probed_at": time.monotonic()}
@@ -449,7 +482,7 @@ def test_ready_tenant_is_written_while_another_probe_is_still_running(env):
 
     inflight = {}
     with (
-        patch.object(agent, "_fc_pid_index", return_value={}),
+        patch.object(agent, "_fc_pid_index", return_value=pids),
         patch.object(agent, "_fast_probe", side_effect=probe),
         ThreadPoolExecutor(max_workers=2) as pool,
     ):

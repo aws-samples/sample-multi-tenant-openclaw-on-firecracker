@@ -493,6 +493,7 @@ _tenant_write_locks = {}
 _tenant_write_locks_guard = threading.Lock()
 _fast_retry_at = {}  # tenant_id -> monotonic time before which the fast loop skips it
 _fast_backoff = {}  # tenant_id -> last back-off delay after a probe found it not ready
+_fast_backoff_fc = {}  # tenant_id -> fc.sock (inode, mtime_ns) the back-off was for
 # Monotonic start time of the newest probe written per tenant. The two loops probe
 # independently, so a poll result taken before a fast-promote write can reach the
 # lock after it; _write_tenant drops such an older result instead of writing it.
@@ -529,7 +530,9 @@ def _acquire_tenant_write_lock(tid, blocking=True):
 
 def _prune_tenant_state(live_tids):
     """Forget per-tenant fast-path state for tenants no longer on this host."""
-    state = (_observed_status, _fast_retry_at, _fast_backoff, _last_probe_at)
+    state = (
+        _observed_status, _fast_retry_at, _fast_backoff, _fast_backoff_fc, _last_probe_at
+    )
     for tid in set().union(*state) - set(live_tids):
         for d in state:
             d.pop(tid, None)
@@ -1850,7 +1853,7 @@ def _write_ddb(results):
         if _observed_status.get(tid) != "creating":
             # Promoted here or no longer a candidate: a later rollback to creating
             # starts the fast probes afresh.
-            _fast_backoff.pop(tid, None)
+            _clear_fast_back_off(tid)
 
 
 def _write_route(tid, info):
@@ -5167,9 +5170,11 @@ def _fast_promote_candidates(now_epoch):
     for tid in entries:
         if _observed_status.get(tid, "creating") != "creating":
             continue
-        if mono < _fast_retry_at.get(tid, 0):
-            continue
         vm_path = os.path.join(VM_DIR, tid)
+        if mono < _fast_retry_at.get(tid, 0):
+            if tid not in _fast_backoff_fc or _fc_sock_id(vm_path) == _fast_backoff_fc[tid]:
+                continue
+            _clear_fast_back_off(tid)  # a new Firecracker: its own grace, from now
         try:
             mtime = os.stat(os.path.join(vm_path, "vm.json")).st_mtime
         except OSError:
@@ -5242,6 +5247,11 @@ def _fast_promote_submit(pool, inflight):
     pid_index = _fc_pid_index()
     if pid_index is None:
         return 0
+    # Without a Firecracker process there is nothing to probe, and a leftover fc.sock
+    # says nothing about when one started: wait for it instead of backing off.
+    candidates = [
+        t for t in candidates if os.path.join(VM_DIR, t, "fc.sock") in pid_index
+    ]
     for tid in candidates:
         inflight[pool.submit(_fast_probe, tid, pid_index)] = tid
     return len(candidates)
@@ -5288,9 +5298,25 @@ def _fast_promote_drain(inflight, timeout):
             _fast_back_off(tid)
             continue
         _fast_backoff.pop(tid, None)
+        _fast_backoff_fc.pop(tid, None)
         if _fast_promote_write(tid, info):
             written += 1
     return written
+
+
+def _fc_sock_id(vm_path):
+    """(inode, mtime_ns) of a VM's fc.sock, or None. A new Firecracker makes a new one."""
+    try:
+        st = os.stat(os.path.join(vm_path, "fc.sock"))
+    except OSError:
+        return None
+    return (st.st_ino, st.st_mtime_ns)
+
+
+def _clear_fast_back_off(tid):
+    _fast_backoff.pop(tid, None)
+    _fast_backoff_fc.pop(tid, None)
+    _fast_retry_at.pop(tid, None)
 
 
 def _fast_back_off(tid):
@@ -5298,19 +5324,22 @@ def _fast_back_off(tid):
 
     The grace runs from Firecracker's start (it creates fc.sock), not from vm.json:
     launch writes vm.json before a download or restore that can outlast the grace.
-    Until Firecracker starts, a probe returns before pinging, so it is not delayed.
+    Only a VM with a Firecracker process is probed, so its fc.sock is that process's.
+    The back-off is tied to that fc.sock: a restarted Firecracker gets a fresh grace.
     """
-    try:
-        started = os.stat(os.path.join(VM_DIR, tid, "fc.sock")).st_mtime
-    except OSError:
+    sock_id = _fc_sock_id(os.path.join(VM_DIR, tid))
+    if sock_id is None:
         return
-    if time.time() - started < FAST_PROMOTE_GRACE_SEC:
+    if time.time() - sock_id[1] / 1e9 < FAST_PROMOTE_GRACE_SEC:
         return
+    if _fast_backoff_fc.get(tid) != sock_id:
+        _fast_backoff.pop(tid, None)
     delay = min(
         _fast_backoff.get(tid, FAST_PROMOTE_RETRY_SEC / 2) * 2,
         FAST_PROMOTE_BACKOFF_MAX_SEC,
     )
     _fast_backoff[tid] = delay
+    _fast_backoff_fc[tid] = sock_id
     _fast_retry_at[tid] = time.monotonic() + delay
 
 

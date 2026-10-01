@@ -74,11 +74,17 @@ publish_stop_intent() {
 # Every launch path re-adds them before Firecracker starts, and this runs under
 # the per-tenant lifecycle lock, so the tenant's own launch cannot interleave. The
 # gateway DNAT (`--dport <host_port>`, no -i) is left alone: stop keeps the route.
+# An iptables-save that fails lists nothing, which is not "no rules": say so, and
+# never let a failed final listing pass for a clean one. The VM is already down by
+# now, so this only warns; the exit status stays what it was.
 purge_tap_rules() {
-  local tap="$1" table rules
+  local tap="$1" table saved rules
   for table in filter nat; do
-    rules="$(sudo iptables-save -t "${table}" 2>/dev/null |
-      grep -E -- "^-A .* -i ${tap}( |$)" | sed 's/^-A /-D /')" || true
+    if ! saved="$(sudo iptables-save -t "${table}" 2>/dev/null)"; then
+      log "WARN: cannot list ${table} iptables rules; ${tap}'s ${table} rules were not purged"
+      continue
+    fi
+    rules="$(grep -E -- "^-A .* -i ${tap}( |$)" <<<"${saved}" | sed 's/^-A /-D /')" || true
     [ -n "${rules}" ] || continue
     if ! printf '*%s\n%s\nCOMMIT\n' "${table}" "${rules}" |
       sudo iptables-restore --noflush 2>/dev/null; then
@@ -90,7 +96,11 @@ purge_tap_rules() {
     fi
   done
   local left
-  left="$(sudo iptables-save 2>/dev/null | grep -cE -- " -i ${tap}( |$)")" || true
+  if ! saved="$(sudo iptables-save 2>/dev/null)"; then
+    log "WARN: cannot list iptables rules; ${tap}'s rules may have survived cleanup"
+    return 0
+  fi
+  left="$(grep -cE -- " -i ${tap}( |$)" <<<"${saved}")" || true
   if [ "${left:-0}" -gt 0 ]; then
     log "WARN: ${left} iptables rules for ${tap} survived cleanup"
   fi

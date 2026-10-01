@@ -763,8 +763,14 @@ COMMIT
 }
 
 
-def _purge(tmp_path, restore_rc=0):
-    """Run stop-vm.sh's purge_tap_rules against stubbed iptables tools."""
+def _purge(tmp_path, restore_rc=0, fail=(), tap="tap-vm7"):
+    """Run stop-vm.sh's purge_tap_rules against stubbed iptables tools.
+
+    iptables-restore really drops the rules it is fed from the saved tables, so the
+    final listing shows what is left. `fail` names the iptables-save calls that are
+    refused ("filter", "nat", or "all" for the final one) the way the kernel refuses
+    them without CAP_NET_ADMIN: exit 4, nothing on stdout.
+    """
     src = (_USERDATA / "stop-vm.sh").read_text()
     start = src.index("purge_tap_rules() {")
     body = src[start:src.index("\n}\n", start) + 3]
@@ -772,18 +778,27 @@ def _purge(tmp_path, restore_rc=0):
     bin_dir.mkdir()
     for table, text in _SAVE.items():
         (tmp_path / f"{table}.save").write_text(text)
+    for name in fail:
+        (tmp_path / f"fail-{name}").touch()
+    deny = 'echo "Permission denied (you must be root)" >&2; exit 4'
     stubs = {
         "sudo": 'exec "$@"',
-        "iptables-save": f'if [ "$1" = -t ]; then cat {tmp_path}/"$2".save; '
-                         f'else cat {tmp_path}/filter.save {tmp_path}/nat.save; fi',
-        "iptables-restore": f'cat >> {tmp_path}/restore.in; exit {restore_rc}',
+        "iptables-save": f'if [ "$1" = -t ]; then [ -e {tmp_path}/fail-"$2" ] && {{ {deny}; }}; '
+                         f'cat {tmp_path}/"$2".save; '
+                         f'else [ -e {tmp_path}/fail-all ] && {{ {deny}; }}; '
+                         f'cat {tmp_path}/filter.save {tmp_path}/nat.save; fi',
+        "iptables-restore": f'b=$(cat); printf "%s\\n" "$b" >> {tmp_path}/restore.in\n'
+                            f'[ {restore_rc} -eq 0 ] || exit {restore_rc}\n'
+                            f't={tmp_path}/$(head -1 <<<"$b" | tr -d "*").save\n'
+                            f'grep "^-D " <<<"$b" | sed "s/^-D /-A /" > {tmp_path}/del\n'
+                            f'grep -vxFf {tmp_path}/del "$t" > "$t.new"; mv "$t.new" "$t"',
         "iptables": f'echo "$*" >> {tmp_path}/iptables.calls',
     }
     for name, code in stubs.items():
         p = bin_dir / name
         p.write_text(f"#!/bin/bash\n{code}\n")
         p.chmod(0o755)
-    script = f'log() {{ echo "LOG $*"; }}\n{body}\npurge_tap_rules tap-vm7\n'
+    script = f'log() {{ echo "LOG $*"; }}\n{body}\npurge_tap_rules {tap}\n'
     env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"}
     r = subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
@@ -791,8 +806,12 @@ def _purge(tmp_path, restore_rc=0):
     return read("restore.in"), read("iptables.calls"), r.stdout
 
 
+def _left(tmp_path):
+    return (tmp_path / "filter.save").read_text() + (tmp_path / "nat.save").read_text()
+
+
 def test_stop_removes_only_this_taps_rules(tmp_path):
-    restore, calls, _ = _purge(tmp_path)
+    restore, calls, out = _purge(tmp_path)
     assert calls == ""
     assert restore == (
         "*filter\n"
@@ -808,6 +827,19 @@ def test_stop_removes_only_this_taps_rules(tmp_path):
     assert "tap-vm70" not in restore
     assert "OPENCLAW-EGRESS" not in restore
     assert "18789" not in restore
+    # A clean purge says nothing, and really leaves the neighbour and shared rules.
+    assert out == ""
+    left = _left(tmp_path)
+    assert " -i tap-vm7 " not in left
+    assert left.count("tap-vm70") == 2
+    assert "OPENCLAW-EGRESS" in left and "--dport 10000" in left
+
+
+def test_stop_with_no_rules_for_the_tap_is_quiet(tmp_path):
+    # Listings that succeed and hold none of this tap's rules: nothing to do, no WARN.
+    restore, calls, out = _purge(tmp_path, tap="tap-vm9")
+    assert (restore, calls, out) == ("", "", "")
+    assert _left(tmp_path) == _SAVE["filter"] + _SAVE["nat"]
 
 
 def test_stop_falls_back_to_one_rule_at_a_time(tmp_path):
@@ -823,6 +855,40 @@ def test_stop_falls_back_to_one_rule_at_a_time(tmp_path):
     assert "WARN: 4 iptables rules for tap-vm7 survived cleanup" in out
 
 
+def test_stop_does_not_take_a_failed_listing_for_no_rules(tmp_path):
+    # Every iptables-save refused: nothing can be purged or verified. That must not
+    # pass for a clean stop (it used to: empty output, 0 survivors, no WARN).
+    restore, calls, out = _purge(tmp_path, fail=("filter", "nat", "all"))
+    assert (restore, calls) == ("", "")
+    assert out.splitlines() == [
+        "LOG WARN: cannot list filter iptables rules; tap-vm7's filter rules were not purged",
+        "LOG WARN: cannot list nat iptables rules; tap-vm7's nat rules were not purged",
+        "LOG WARN: cannot list iptables rules; tap-vm7's rules may have survived cleanup",
+    ]
+    assert _left(tmp_path) == _SAVE["filter"] + _SAVE["nat"]
+
+
+def test_stop_still_purges_the_table_it_can_list(tmp_path):
+    # Only the filter listing refused: nat is still purged, and the final check,
+    # which works, counts the filter rules that are left.
+    restore, calls, out = _purge(tmp_path, fail=("filter",))
+    assert calls == ""
+    assert restore.startswith("*nat\n") and "*filter" not in restore
+    assert out.splitlines() == [
+        "LOG WARN: cannot list filter iptables rules; tap-vm7's filter rules were not purged",
+        "LOG WARN: 3 iptables rules for tap-vm7 survived cleanup",
+    ]
+    assert "tap-vm7 " not in (tmp_path / "nat.save").read_text()
+
+
+def test_stop_warns_when_the_final_check_cannot_run(tmp_path):
+    # The purge itself went through; only the verification is refused.
+    restore, _, out = _purge(tmp_path, fail=("all",))
+    assert "*filter" in restore and "*nat" in restore
+    assert " -i tap-vm7 " not in _left(tmp_path)
+    assert out == "LOG WARN: cannot list iptables rules; tap-vm7's rules may have survived cleanup\n"
+
+
 _LINKS = """1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue state UNKNOWN
 2: ens5: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 9001 qdisc mq state UP
 9: tap-vm70: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc fq_codel state UP
@@ -830,9 +896,14 @@ _LINKS = """1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue state UNKNOWN
 _TAP7 = "8: tap-vm7: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc fq_codel state UP\n"
 
 
-def _teardown(tmp_path, links, show_rc=0, awk_fails=False, vm_json='{"vm_num": 7}'):
+def _teardown(tmp_path, links, show_rc=0, awk_fails=False, vm_json='{"vm_num": 7}',
+              real_purge=False):
     """Run stop-vm.sh's real teardown block for VM_NUM=7 against a stubbed ip."""
     src = (_USERDATA / "stop-vm.sh").read_text()
+    purge = 'purge_tap_rules() { echo "PURGE $1"; }\n'
+    if real_purge:
+        p = src.index("purge_tap_rules() {")
+        purge = src[p:src.index("\n}\n", p) + 3]
     start = src.index("_own_vm_num=$(")
     block = src[start:src.index('rm -f "${VM_DIR}/fc.sock"', start)]
     bin_dir = tmp_path / "bin"
@@ -851,14 +922,15 @@ def _teardown(tmp_path, links, show_rc=0, awk_fails=False, vm_json='{"vm_num": 7
           '[ "$1 $2" = "link del" ] && exit 1\n'
           'exit 2')
     stubs = {"sudo": 'exec "$@"', "ip": ip}
+    for name in ("iptables-save", "iptables-restore", "iptables"):
+        stubs[name] = f'echo "{name} $*" >> {ip_log}'
     if awk_fails:
         stubs["awk"] = "exit 2"
     for name, code in stubs.items():
         (bin_dir / name).write_text(f"#!/bin/bash\n{code}\n")
         (bin_dir / name).chmod(0o755)
     script = ('set -o pipefail\nlog() { echo "LOG $*"; }\n'
-              'purge_tap_rules() { echo "PURGE $1"; }\n'
-              f"VM_NUM=7\nVM_DIR={vm_dir}\n{block}")
+              f"{purge}VM_NUM=7\nVM_DIR={vm_dir}\n{block}")
     env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"}
     out = subprocess.run(["bash", "-c", script], env=env, capture_output=True,
                          text=True, check=True).stdout
@@ -897,3 +969,13 @@ def test_stop_never_touches_a_tap_this_tenant_does_not_own(tmp_path, vm_json):
     assert "link del" not in ip_calls
     assert "PURGE" not in out
     assert "WARN:" in out and "leaving every tap" in out
+
+
+@pytest.mark.parametrize("vm_json", [None, "{not json", '{"vm_num": "7"}'],
+                         ids=["no_vm_json", "bad_json", "not_int"])
+def test_unproven_ownership_reaches_no_iptables_tool(tmp_path, vm_json):
+    # With the real purge in place: no tap delete, and not a single iptables call,
+    # so the iptables-save handling cannot widen what an unowned stop touches.
+    out, calls = _teardown(tmp_path, _LINKS + _TAP7, vm_json=vm_json, real_purge=True)
+    assert calls == ""
+    assert out.count("WARN:") == 1 and "leaving every tap" in out

@@ -16,6 +16,7 @@ import subprocess
 import sys
 import threading
 import time
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 import boto3
@@ -36,6 +37,32 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import route_ops  # noqa: E402
 
 POLL_INTERVAL = int(os.environ.get("OC_AGENT_POLL_INTERVAL", "15"))
+# A creating tenant used to wait for the next full poll pass to be promoted, and a
+# pass grows with the number of VMs on the host (~25 s at 290 VMs, measured on
+# r8g.metal-24xl). The fast-promote loop probes only recently launched creating VMs
+# and promotes them as soon as the gateway answers. 0 disables it.
+FAST_PROMOTE_INTERVAL = float(os.environ.get("OC_AGENT_FAST_PROMOTE_INTERVAL", "1"))
+# Only VMs whose vm.json was written this recently are candidates, so a tenant stuck
+# in creating falls back to the poll loop instead of being probed every second forever.
+FAST_PROMOTE_WINDOW_SEC = int(os.environ.get("OC_AGENT_FAST_PROMOTE_WINDOW_SEC", "900"))
+# After an attempt that did not promote (CAS guard still blocking), wait this long
+# before trying the same tenant again.
+FAST_PROMOTE_RETRY_SEC = float(os.environ.get("OC_AGENT_FAST_PROMOTE_RETRY_SEC", "5"))
+# A candidate whose gateway has not answered is probed every tick for this long after
+# its Firecracker started (gateways answer within seconds of boot), then backed off
+# exponentially from FAST_PROMOTE_RETRY_SEC up to FAST_PROMOTE_BACKOFF_MAX_SEC, so VMs
+# whose gateway never comes up do not keep the probe workers from new ones. The poll
+# pass still promotes a late one.
+FAST_PROMOTE_GRACE_SEC = float(os.environ.get("OC_AGENT_FAST_PROMOTE_GRACE_SEC", "60"))
+FAST_PROMOTE_BACKOFF_MAX_SEC = float(
+    os.environ.get("OC_AGENT_FAST_PROMOTE_BACKOFF_MAX_SEC", "60")
+)
+FAST_PROMOTE_PARALLEL = int(os.environ.get("OC_AGENT_FAST_PROMOTE_PARALLEL", "8"))
+# Gateway check timeout on the fast path. A gateway slower than this is left to the
+# next fast tick or the poll pass instead of holding a probe worker for 8 s.
+FAST_PROMOTE_PROBE_TIMEOUT_SEC = float(
+    os.environ.get("OC_AGENT_FAST_PROMOTE_PROBE_TIMEOUT_SEC", "2")
+)
 PORT = int(os.environ.get("OC_AGENT_PORT", "8899"))
 # Health/control AND Prometheus /metrics are served by the SAME HTTPServer
 # on PORT (8899). The earlier OC_AGENT_PROM_PORT=9090 split-port design was
@@ -91,7 +118,11 @@ _PROM_GAUGES = (
 
 
 def _render_metrics_text(
-    snapshots, port_stats=None, agent_stats=None, stranding=None
+    snapshots,
+    port_stats=None,
+    agent_stats=None,
+    stranding=None,
+    balloon_stats=None,
 ):
     """Render the in-memory snapshots dict as Prometheus exposition text.
 
@@ -160,6 +191,48 @@ def _render_metrics_text(
         out.append("# TYPE openclaw_host_dnat_ports_quarantined gauge")
         out.append(
             f"openclaw_host_dnat_ports_quarantined {int(port_stats['quarantined'])}"
+        )
+    if isinstance(balloon_stats, dict):
+        out.append(
+            "# HELP openclaw_host_balloon_actual_mib sum of actual_mib the GUEST"
+            " drivers report holding across inspected VMs. Guest-reported, so it is"
+            " an indication, NOT proof of physical reclamation: pages a guest hands"
+            " over may never have been host-resident. Judge real reclamation by the"
+            " same-PID VmRSS delta and host MemAvailable, not by this series."
+        )
+        out.append("# TYPE openclaw_host_balloon_actual_mib gauge")
+        out.append(
+            "openclaw_host_balloon_actual_mib"
+            f" {int(balloon_stats.get('actual_mib') or 0)}"
+        )
+        out.append(
+            "# HELP openclaw_host_balloon_stats_unavailable VMs whose balloon"
+            " statistics were unavailable in the last controller cycle"
+        )
+        out.append("# TYPE openclaw_host_balloon_stats_unavailable gauge")
+        out.append(
+            "openclaw_host_balloon_stats_unavailable"
+            f" {int(balloon_stats.get('stats_unavailable') or 0)}"
+        )
+        out.append(
+            "# HELP openclaw_host_balloon_actions balloon target changes issued"
+            " in the last controller cycle"
+        )
+        out.append("# TYPE openclaw_host_balloon_actions gauge")
+        out.append(
+            "openclaw_host_balloon_actions"
+            f" {int(balloon_stats.get('actions') or 0)}"
+        )
+        out.append(
+            "# HELP openclaw_host_balloon_lock_contended tenants skipped in the last"
+            " controller cycle because their lifecycle lock was held (launch/stop/"
+            "delete/migrate/backup in flight). Persistently non-zero means the"
+            " controller is not reaching those tenants at all."
+        )
+        out.append("# TYPE openclaw_host_balloon_lock_contended gauge")
+        out.append(
+            "openclaw_host_balloon_lock_contended"
+            f" {int(balloon_stats.get('lock_contended') or 0)}"
         )
     # Grafana 侧算比率,避免 agent 侧固化一个除法口径。stranding=None → 整组省略。
     if isinstance(stranding, tuple) and len(stranding) == 4:
@@ -352,6 +425,52 @@ BALLOON_MAX_INFLATE_RATIO = float(os.environ.get("BALLOON_MAX_INFLATE_RATIO", "0
 BALLOON_MIN_GUEST_AVAILABLE_MB = int(
     os.environ.get("BALLOON_MIN_GUEST_AVAILABLE_MB", "512")
 )
+BALLOON_STEP_MIB = int(os.environ.get("BALLOON_STEP_MIB", "64"))
+BALLOON_CUSHION_MIB = int(os.environ.get("BALLOON_CUSHION_MIB", "64"))
+BALLOON_CONVERGE_TOLERANCE_MIB = int(
+    os.environ.get("BALLOON_CONVERGE_TOLERANCE_MIB", "16")
+)
+BALLOON_MAX_ACTIONS_PER_CYCLE = int(
+    os.environ.get("BALLOON_MAX_ACTIONS_PER_CYCLE", "20")
+)
+BALLOON_DEFLATE_BATCH = int(os.environ.get("BALLOON_DEFLATE_BATCH", "5"))
+# Attempts, not successes. Each failing PATCH can burn the curl --max-time (5s), and
+# _adjust_balloons runs inline in _poll_loop, so an unbounded walk over a large fleet
+# of failing VMs would block the heartbeat and DDB reconcile for minutes. Bound the
+# attempts and rotate the starting point instead (see _deflate_balloon_batch).
+BALLOON_MAX_ATTEMPTS_PER_CYCLE = int(
+    os.environ.get("BALLOON_MAX_ATTEMPTS_PER_CYCLE", "10")
+)
+# Wall-clock ceiling for one whole _adjust_balloons pass. The attempt cap bounds
+# PATCHes, but every VM also costs a statistics GET, and each of those can burn
+# curl's --max-time on a slow or hung socket; on a large fleet that alone could hold
+# the poll loop for minutes ahead of the heartbeat and the DDB reconcile. Under the
+# 5s poll interval so a slow pass cannot pile up. The scan start rotates, so a
+# truncated pass still covers the rest of the fleet on the next cycles.
+BALLOON_CYCLE_BUDGET_SEC = float(os.environ.get("BALLOON_CYCLE_BUDGET_SEC", "2.0"))
+# Deflation gets its OWN budget, granted AFTER the scan finishes. Sharing a single
+# cycle deadline was a starvation bug: a fleet of slow sockets consumed the whole
+# budget during the statistics scan, so the deflate walk hit an already-expired
+# deadline on its first check and issued zero PATCHes — every cycle, forever, leaving
+# tenant memory unrecoverable. Worst case per cycle is now scan + action, both under
+# the 5s poll interval combined.
+BALLOON_ACTION_BUDGET_SEC = float(os.environ.get("BALLOON_ACTION_BUDGET_SEC", "1.0"))
+# Per-call timeout for the balloon API, now also passed to curl as --max-time so curl
+# gives up on its own instead of relying solely on the subprocess kill.
+#
+# Kept at the pre-existing 5s on purpose. The acted-on path costs two GETs plus a PATCH
+# (the scan reads, then the locked apply re-reads), and the per-cycle budgets bound how
+# MANY VMs are touched but cannot bound a single hung socket — the checks sit between
+# VMs, not inside one. So one pathological VM can still hold the poll loop for roughly
+# three call timeouts, about 15s, not the cycle budget. Lowering this shrinks that bound
+# but risks manufacturing spurious `stats_unavailable` and failed PATCHes if the
+# Firecracker API is ever slower than the new value under real fleet density, which is
+# not something this branch measured. Left as a knob for an operator who has measured
+# their own latency distribution.
+BALLOON_API_TIMEOUT_SEC = float(os.environ.get("BALLOON_API_TIMEOUT_SEC", "5.0"))
+BALLOON_ALLOW_BLIND_INFLATE = (
+    os.environ.get("BALLOON_ALLOW_BLIND_INFLATE", "false").lower() == "true"
+)
 
 # DynamoDB client (region auto-detected from instance metadata)
 _ddb = None
@@ -361,6 +480,87 @@ _consecutive_cred_failures = 0
 _CRED_FAILURE_EXIT_THRESHOLD = int(os.environ.get("AGENT_CRED_FAIL_EXIT_THRESHOLD", "12"))
 _status = {}
 _lock = threading.Lock()
+
+# Status returned by the latest health write per tenant (poll or fast-promote loop).
+# The fast-promote loop only considers tenants whose last observed status is creating
+# or unknown; the poll loop refreshes it on every pass, so a rollback to creating is
+# picked up within one pass.
+_observed_status = {}
+# Serializes the route + health + promote write of one tenant between the poll loop
+# and the fast-promote loop, so the two never run _ensure_route for the same tenant
+# at the same time.
+_tenant_write_locks = {}
+_tenant_write_locks_guard = threading.Lock()
+_fast_retry_at = {}  # tenant_id -> monotonic time before which the fast loop skips it
+_fast_backoff = {}  # tenant_id -> last back-off delay after a probe found it not ready
+_fast_backoff_fc = {}  # tenant_id -> fc.sock (inode, mtime_ns) the back-off was for
+# Monotonic start time of the newest probe written per tenant. The two loops probe
+# independently, so a poll result taken before a fast-promote write can reach the
+# lock after it; _write_tenant drops such an older result instead of writing it.
+# Only the health and promote writes are dropped: an older poll result still writes
+# its metrics, which the fast loop never collects. Otherwise a tenant the fast loop
+# rewrites every FAST_PROMOTE_RETRY_SEC (held in creating by a CAS guard) would get
+# no metrics at all.
+_last_probe_at = {}
+
+
+def _tenant_write_lock(tid):
+    with _tenant_write_locks_guard:
+        lk = _tenant_write_locks.get(tid)
+        if lk is None:
+            lk = _tenant_write_locks[tid] = threading.Lock()
+        return lk
+
+
+def _acquire_tenant_write_lock(tid, blocking=True):
+    """Acquire the tenant's write lock; None if not blocking and it is held.
+
+    _prune_tenant_state may drop the lock between the lookup and the acquire;
+    holding a dropped lock would let a second writer create and take a new one.
+    """
+    while True:
+        lk = _tenant_write_lock(tid)
+        if not lk.acquire(blocking=blocking):
+            return None
+        with _tenant_write_locks_guard:
+            if _tenant_write_locks.get(tid) is lk:
+                return lk  # held, so prune leaves it alone from here
+        lk.release()
+
+
+def _prune_tenant_state(live_tids):
+    """Forget per-tenant fast-path state for tenants no longer on this host."""
+    state = (
+        _observed_status, _fast_retry_at, _fast_backoff, _fast_backoff_fc, _last_probe_at
+    )
+    for tid in set().union(*state) - set(live_tids):
+        for d in state:
+            d.pop(tid, None)
+    with _tenant_write_locks_guard:
+        for tid in list(_tenant_write_locks):
+            if tid not in live_tids and not _tenant_write_locks[tid].locked():
+                del _tenant_write_locks[tid]
+
+# Balloon controller counters, reset each _adjust_balloons cycle. Exposed on
+# /metrics so a silently inert controller is visible instead of invisible
+# (the failure mode this issue was filed for).
+_balloon_cycle = {
+    "actions": 0,
+    "stats_unavailable": 0,
+    "actual_mib": 0,
+    "lock_contended": 0,
+}
+# Rotating start offset for the deflate walk. Without it, bounding the attempts per
+# cycle would re-introduce the starvation the batch fix removed: a wedged head would
+# simply consume the attempt budget every cycle instead of the whole list.
+_balloon_deflate_cursor = 0
+# Rotating start offset for the per-VM scan (the statistics GET). Pairs with the
+# cycle time budget: a pass cut short by the budget resumes where it stopped, so no
+# tenant is permanently invisible to the controller.
+_balloon_scan_cursor = 0
+# Last COMPLETED cycle, published atomically at the end of _adjust_balloons and
+# read by /metrics. None until the controller has run once.
+_balloon_metrics = None
 
 # _status is a tenant map; a host-level key mixed in would be rendered as a
 # phantom tenant by the per-tenant gauge loops above. Guarded by _lock (same
@@ -519,6 +719,11 @@ def _ensure_route(tenant_id: str, guest_ip: str) -> tuple[str, int | None]:
 
     Redis write failure does NOT propagate: contract §6 HA — DDB is
     authoritative and route.lua fail-static handles the transient gap.
+
+    Always checks the live DNAT rules: another process (delete-vm.sh, the
+    route_ops CLI over SSM) may have released this tenant's port since the last
+    tick, and a route written to that port from a stale listing points at
+    whoever is allocated it after the quarantine.
     """
     host_ip = _get_host_private_ip()
     bitmap = _get_port_bitmap()
@@ -926,7 +1131,7 @@ def _mounted_image_snapshots(fc_pid, proc_root="/proc"):
     return evidence
 
 
-def _probe_app_health(guest_ip, chat_ep):
+def _probe_app_health(guest_ip, chat_ep, timeout=8):
     """探 guest gateway 的 app_health,返回 "up"/"down"。
 
     #526 — 对开了 chatCompletions 的租户(chat_ep 为真)收紧判据:探真实数据面入口
@@ -946,7 +1151,7 @@ def _probe_app_health(guest_ip, chat_ep):
                            f"http://{guest_ip}:{GATEWAY_PORT}/v1/chat/completions"]
         else:
             args = base + [f"http://{guest_ip}:{GATEWAY_PORT}/"]
-        r = subprocess.run(args, capture_output=True, timeout=8)
+        r = subprocess.run(args, capture_output=True, timeout=timeout)
         code = (r.stdout or b"").decode(errors="replace").strip()
         if r.returncode != 0 or not code.isdigit() or code == "000":
             return "down"  # 端口不通/无 HTTP 应答
@@ -957,6 +1162,104 @@ def _probe_app_health(guest_ip, chat_ep):
         return "down"
 
 
+def _fc_pid_index():
+    """Scan the process table once: {api-sock path: lowest pid}, or None on failure.
+
+    `pgrep -f` reads every /proc/<pid>/cmdline, ~40 ms on a 290-VM host, and the
+    poll pass used to run it once per VM (~11 s of a ~25 s pass). The lowest pid
+    matches what the per-VM `pgrep -f "api-sock <sock>"` returned first.
+    """
+    try:
+        r = subprocess.run(
+            ["pgrep", "-af", "api-sock"], capture_output=True, text=True, timeout=10
+        )
+    except Exception:
+        return None
+    if r.returncode not in (0, 1):  # 1 = no process matched, a valid empty answer
+        return None
+    index = {}
+    for line in r.stdout.splitlines():
+        toks = line.split()
+        try:
+            pid = int(toks[0])
+        except (ValueError, IndexError):
+            continue
+        for i, tok in enumerate(toks[1:-1], start=1):
+            if tok.endswith("api-sock"):
+                sock = toks[i + 1]
+                if sock not in index or pid < index[sock]:
+                    index[sock] = pid
+    return index
+
+
+def _fc_pid(sock_file, index):
+    """Firecracker pid for one VM from the pass snapshot.
+
+    A VM missing from the snapshot is re-checked with its own pgrep before the
+    caller treats it as dead: the snapshot predates the pass, and a VM launched
+    since then must not be sent to _recover_vm.
+    """
+    if index is not None and sock_file in index:
+        return index[sock_file]
+    pgrep = subprocess.run(
+        ["pgrep", "-f", f"api-sock {sock_file}"], capture_output=True, text=True
+    )
+    if pgrep.returncode == 0:
+        pids = pgrep.stdout.strip().split()
+        if pids:
+            try:
+                return int(pids[0])
+            except (ValueError, IndexError):
+                pass
+    return None
+
+
+def _probed_result(
+    fc_pid, guest_ip, phys_vm_num, observed_image, vm_health, app_health, probed_at
+):
+    """Probe result of a VM whose Firecracker is running (poll and fast-promote loops).
+
+    probed_at is the monotonic time the probe started; see _last_probe_at.
+    """
+    mounted_evidence = (
+        _mounted_image_snapshots(fc_pid) if vm_health == "up" else {}
+    )
+    return {
+        "vm_health": vm_health,
+        "app_health": app_health,
+        "guest_ip": guest_ip,
+        "fc_pid": fc_pid,
+        "phys_vm_num": phys_vm_num,
+        "probed_at": probed_at,
+        # 只在【VM 真的起来了】时才上报版本(vm_health=="up" 即 guest ping 通),并连
+        # FC 进程的启动时刻一起上报。
+        #
+        # 为什么两者都必须有:launch-vm.sh 在起 firecracker 之前 800+ 行就把版本写进了
+        # vm.json(建盘/mkfs/解压/拉备份都在那之后),所以「vm.json 里有目标版本」只
+        # 证明启动流程走到了那一行。两种假成功由此而来:
+        #   ① 中途失败 → 版本==目标但 VM 根本没起(ping 不通挡掉);
+        #   ② 旧 FC 没被 stop-vm 杀掉 → VM ping 得通、vm.json 已改成新版本,但跑的还是
+        #      【旧】rootfs(ping 挡不住,只能靠进程启动时刻:它早于本次 rebuild 发起
+        #      时刻,说明这不是本次起来的进程)。
+        # 控制面据此把判据从「版本相符」升格为「版本相符 且 进程是本次 rebuild 之后
+        # 新起的」。缺失该时刻(读不到 /proc)时控制面不得单凭版本判 done。
+        **(
+            {
+                "observed_image_snapshot_time": observed_image,
+                "observed_boot_at": _fc_boot_iso(fc_pid),
+                "observed_mounted_rootfs_snapshot_time": (
+                    mounted_evidence.get("rootfs", "")
+                ),
+                "observed_mounted_immutable_snapshot_time": (
+                    mounted_evidence.get("immutable", "")
+                ),
+            }
+            if vm_health == "up"
+            else {}
+        ),
+    }
+
+
 def _probe_all():
     """Probe all local VMs."""
     results = {}
@@ -964,8 +1267,10 @@ def _probe_all():
         entries = os.listdir(VM_DIR)
     except FileNotFoundError:
         return results
+    pid_index = _fc_pid_index()
 
     for tenant_id in entries:
+        probed_at = time.monotonic()
         vm_path = os.path.join(VM_DIR, tenant_id)
         cfg_file = os.path.join(vm_path, "vm.json")
         if not os.path.isfile(cfg_file):
@@ -1008,17 +1313,7 @@ def _probe_all():
         # Capture pid here too so the metrics composer can read /proc/<pid>
         # without re-running pgrep on every gauge.
         sock_file = os.path.join(vm_path, "fc.sock")
-        pgrep = subprocess.run(
-            ["pgrep", "-f", f"api-sock {sock_file}"], capture_output=True, text=True
-        )
-        fc_pid = None
-        if pgrep.returncode == 0:
-            pids = pgrep.stdout.strip().split()
-            if pids:
-                try:
-                    fc_pid = int(pids[0])
-                except (ValueError, IndexError):
-                    pass
+        fc_pid = _fc_pid(sock_file, pid_index)
         fc_running = fc_pid is not None
 
         if not fc_running:
@@ -1028,6 +1323,7 @@ def _probe_all():
                 "app_health": "down",
                 "guest_ip": guest_ip,
                 "phys_vm_num": phys_vm_num,
+                "probed_at": probed_at,
                 # 不带 observed_image_snapshot_time:此刻 Firecracker 并未在跑(或 guest
                 # 不可达正在重建网络),vm.json 里的版本只是"上次启动打算用哪个版本",
                 # 不构成"这台 VM 现在真的跑着该版本"的证据。上报它会让控制面把一次
@@ -1065,6 +1361,7 @@ def _probe_all():
                 "app_health": "down",
                 "guest_ip": guest_ip,
                 "phys_vm_num": phys_vm_num,
+                "probed_at": probed_at,
                 # 不带 observed_image_snapshot_time:此刻 Firecracker 并未在跑(或 guest
                 # 不可达正在重建网络),vm.json 里的版本只是"上次启动打算用哪个版本",
                 # 不构成"这台 VM 现在真的跑着该版本"的证据。上报它会让控制面把一次
@@ -1072,42 +1369,10 @@ def _probe_all():
             }
             continue
 
-        mounted_evidence = (
-            _mounted_image_snapshots(fc_pid) if vm_health == "up" else {}
+        results[tenant_id] = _probed_result(
+            fc_pid, guest_ip, phys_vm_num, observed_image, vm_health, app_health,
+            probed_at,
         )
-        results[tenant_id] = {
-            "vm_health": vm_health,
-            "app_health": app_health,
-            "guest_ip": guest_ip,
-            "fc_pid": fc_pid,
-            "phys_vm_num": phys_vm_num,
-            # 只在【VM 真的起来了】时才上报版本(vm_health=="up" 即 guest ping 通),并连
-            # FC 进程的启动时刻一起上报。
-            #
-            # 为什么两者都必须有:launch-vm.sh 在起 firecracker 之前 800+ 行就把版本写进了
-            # vm.json(建盘/mkfs/解压/拉备份都在那之后),所以「vm.json 里有目标版本」只
-            # 证明启动流程走到了那一行。两种假成功由此而来:
-            #   ① 中途失败 → 版本==目标但 VM 根本没起(ping 不通挡掉);
-            #   ② 旧 FC 没被 stop-vm 杀掉 → VM ping 得通、vm.json 已改成新版本,但跑的还是
-            #      【旧】rootfs(ping 挡不住,只能靠进程启动时刻:它早于本次 rebuild 发起
-            #      时刻,说明这不是本次起来的进程)。
-            # 控制面据此把判据从「版本相符」升格为「版本相符 且 进程是本次 rebuild 之后
-            # 新起的」。缺失该时刻(读不到 /proc)时控制面不得单凭版本判 done。
-            **(
-                {
-                    "observed_image_snapshot_time": observed_image,
-                    "observed_boot_at": _fc_boot_iso(fc_pid),
-                    "observed_mounted_rootfs_snapshot_time": (
-                        mounted_evidence.get("rootfs", "")
-                    ),
-                    "observed_mounted_immutable_snapshot_time": (
-                        mounted_evidence.get("immutable", "")
-                    ),
-                }
-                if vm_health == "up"
-                else {}
-            ),
-        }
 
     return results
 
@@ -1445,8 +1710,12 @@ def _write_host_heartbeat():
 
 
 def _refresh_health(table, tid, info, now, metrics, host_port=None):
-    """Health-refresh write for a tenant NOT promoted this tick (already
-    running, still creating with the gateway not up yet, or down).
+    """Refresh tenant health and return the stored status from the same write.
+
+    A healthy VM is promoted only if this write returns `creating`. Status is
+    checked on every poll: a failed delete can roll `deleting` back to `creating`,
+    so observing a non-creating status is not safe to cache for the process lifetime.
+    ALL_NEW adds no read request; the returned item is inspected, never logged.
 
     `host_port` (#526): pass the value `_ensure_route` just returned so the
     record's advertised port is reconciled to the live bitmap/DNAT truth — same
@@ -1561,10 +1830,12 @@ def _refresh_health(table, tid, info, now, metrics, host_port=None):
         "UpdateExpression": expr,
         "ConditionExpression": "attribute_exists(id) AND host_id = :self",
         "ExpressionAttributeValues": vals,
+        "ReturnValues": "ALL_NEW",
     }
     if names:
         kwargs["ExpressionAttributeNames"] = names
-    table.update_item(**kwargs)
+    result = table.update_item(**kwargs)
+    return result.get("Attributes", {}).get("status")
 
 
 def _write_ddb(results):
@@ -1574,190 +1845,281 @@ def _write_ddb(results):
     table = _get_ddb().Table(TENANTS_TABLE)
     now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     for tid, info in results.items():
-        # 撞号检查(create + migrate)对它们会退回 vm_num,迁移过的会有短暂盲区。这里用 vm.json
-        # 里的物理 vm_num 补齐,if_not_exists 保证只写一次、绝不覆盖(create 已写的、或先前
-        # 回填的都不动)——迁移把 vm_num 翻成 target 槽时 phys_vm_num 恒定,靠的正是"绝不覆盖"。
-        _pvn = info.get("phys_vm_num")
-        if tid not in _phys_backfilled and isinstance(_pvn, int):
+        lk = _acquire_tenant_write_lock(tid)
+        try:
+            _write_tenant(table, tid, info, now)
+        finally:
+            lk.release()
+        if _observed_status.get(tid) != "creating":
+            # Promoted here or no longer a candidate: a later rollback to creating
+            # starts the fast probes afresh.
+            _clear_fast_back_off(tid)
+
+
+def _write_route(tid, info):
+    """_ensure_route for _write_tenant: (host_ip, port), or None to skip this tick."""
+    try:
+        host_private_ip, host_port = _ensure_route(tid, info["guest_ip"])
+    except Exception as e:
+        print(f"ensure_route {tid} failed (skip promote this tick): {e}")
+        # tenant stuck at creating; counting only one under-reports.
+        with _lock:
+            _agent_metrics["route_ensure_failures"] += 1
+        return None
+    if not host_private_ip or host_port is None:
+        print(f"ensure_route {tid} degraded (host_ip or port missing)")
+        with _lock:
+            _agent_metrics["route_ensure_failures"] += 1
+        return None
+    return host_private_ip, host_port
+
+
+def _collect_metrics(tid, info, via):
+    """Per-VM metrics for a poll write, mirrored into info; None if not collected.
+
+    Skipped for down/recovering VMs to keep their last-known metrics
+    rather than overwriting with zeros (which would mask the failure).
+    Also skipped on the fast path: balloon stats and dumpe2fs can take seconds,
+    the fast loop writes one tenant at a time, and the next poll fills them in.
+    """
+    if info["vm_health"] != "up" or via == "fast":
+        return None
+    metrics = None
+    sock_file = os.path.join(VM_DIR, tid, "fc.sock")
+    data_file = os.path.join(VM_DIR, tid, "data.ext4")
+    cfg_file = os.path.join(VM_DIR, tid, "vm.json")
+    vm_mem_mb = 4096
+    vm_vcpu = 1
+    try:
+        with open(cfg_file, encoding="utf-8") as f:
+            cfg = json.load(f)
+            vm_mem_mb = cfg.get("mem_mb", 4096)
+            vm_vcpu = cfg.get("vcpu", 1) or 1
+    except Exception:
+        pass
+    fc_pid = info.get("fc_pid")
+    try:
+        metrics = _compose_metrics(
+            tid, vm_mem_mb, sock_file, data_file, fc_pid=fc_pid, vcpu=vm_vcpu
+        )
+    except Exception as e:
+        print(f"compose_metrics {tid}: {e}")
+    # Mirror computed metrics back into the in-memory snapshot so
+    # the Prometheus exporter (/metrics endpoint scraped by ADOT
+    # → AMP) sees the actual per-VM gauges. Without this only
+    # vm_health was being exposed, leaving openclaw_vm_memory_used_mb
+    # / disk_used_mb / disk_used_pct etc. empty in AMP. (Companion
+    # fix to the 8899/9090 port-mismatch — both shipped 1.2.5.)
+    if metrics is not None:
+        info["metrics"] = metrics
+    return metrics
+
+
+def _write_older_metrics(table, tid, info, via):
+    """Write only the metrics of a result older than the last one written.
+
+    Its health fields are older than what DDB and /metrics already hold, so they
+    are dropped; the metrics are not, since the fast loop never collects them.
+    """
+    metrics = _collect_metrics(tid, info, via)
+    if metrics is None:
+        return
+    with _lock:
+        current = _status.get(tid)
+        if current is not None:
+            current["metrics"] = metrics
+    try:
+        table.update_item(
+            Key={"id": tid},
+            UpdateExpression="SET #m = :m",
+            # Stricter than the health write: this result was dropped before, so it
+            # must not start refreshing a soft-deleted record that keeps host_id.
+            ConditionExpression="attribute_exists(id) AND host_id = :self AND #s <> :d",
+            ExpressionAttributeNames={"#m": "metrics", "#s": "status"},
+            ExpressionAttributeValues={
+                ":m": metrics, ":self": INSTANCE_ID, ":d": "deleted"
+            },
+        )
+    except table.meta.client.exceptions.ConditionalCheckFailedException:
+        pass  # gone, deleted or owned by another host
+    except Exception as e:
+        print(f"ddb metrics update {tid}: {e}")
+
+
+def _write_tenant(table, tid, info, now, via="poll"):
+    """Route + health write for one tenant, then promote it if it is still creating.
+
+    Caller holds _tenant_write_lock(tid). Records the status the health write
+    observed in _observed_status for the fast-promote loop. A result whose probe
+    started before the last one written for this tenant writes only its metrics.
+    """
+    probed_at = info.get("probed_at")
+    if probed_at is not None:
+        if probed_at < _last_probe_at.get(tid, probed_at):
+            _write_older_metrics(table, tid, info, via)
+            return
+        _last_probe_at[tid] = probed_at
+    # 撞号检查(create + migrate)对它们会退回 vm_num,迁移过的会有短暂盲区。这里用 vm.json
+    # 里的物理 vm_num 补齐,if_not_exists 保证只写一次、绝不覆盖(create 已写的、或先前
+    # 回填的都不动)——迁移把 vm_num 翻成 target 槽时 phys_vm_num 恒定,靠的正是"绝不覆盖"。
+    _pvn = info.get("phys_vm_num")
+    if tid not in _phys_backfilled and isinstance(_pvn, int):
+        try:
+            table.update_item(
+                Key={"id": tid},
+                UpdateExpression="SET phys_vm_num = if_not_exists(phys_vm_num, :pvn)",
+                ConditionExpression="attribute_exists(id)",
+                ExpressionAttributeValues={":pvn": _pvn},
+            )
+            _phys_backfilled.add(tid)
+        except table.meta.client.exceptions.ConditionalCheckFailedException:
+            _phys_backfilled.add(tid)  # 租户已删,别再试
+        except Exception as e:
+            print(f"phys_vm_num backfill {tid} (non-fatal): {e}")
+
+    metrics = _collect_metrics(tid, info, via)
+
+    try:
+        # gateway 崩溃重启(schema fail-closed 拒未知 key 等)的 VM 冒充 running——
+        # ping 通但 gateway HTTP server 挂,租户对外全 502 却报 running(实测 gateway
+        # 崩 2715 次仍 running)。promote 要 VM 活(ping)且 gateway 活(18789 端口有
+        # HTTP 应答,见上面 app_health 探测:不探版本相关的具体路由,只判 HTTP server
+        # 是否应答,兼容 openclaw 2.26 无 /healthz 端点全 404 的情况)。
+        # 只 ping 通、gateway 未起的 VM 停在 creating,由 else 分支刷 health 字段,
+        # 下 tick 再 promote(不 promote ≠ 报错,只是等 gateway 就绪)。
+        if info["vm_health"] == "up" and info["app_health"] == "up":
+            # P2b (contract §3/§4): allocate host_port + write DNAT +
+            # publish Redis route BEFORE promoting. If port alloc fails
+            # (bitmap exhausted or iptables broke), skip promotion this
+            # tick — the next probe will retry. gateway_token is P1's
+            # concern (control-plane pre-mints ciphertext into DDB at
+            # create); host-agent no longer SSH-reads it (§4).
+            route = _write_route(tid, info)
+            if route is None:
+                return
+            host_private_ip, host_port = route
+            # Use the existing health write to observe status on EVERY tick.
+            # Running tenants still pay for just one write; a delete rollback
+            # or reused tenant ID cannot leave behind a stale promote memo.
+            # Keep this after route reconciliation so the advertised port is
+            # always the one actually installed on this host.
+            status = _refresh_health(
+                table, tid, info, now, metrics, host_port=host_port
+            )
+            _observed_status[tid] = status
+            if status != "creating":
+                return
+            # NOTE: `metrics` is a DynamoDB reserved keyword, so it must be
+            # referenced via an ExpressionAttributeNames placeholder (#m).
+            # Same for `status` (#s, already aliased). Without #m the
+            # update_item call returns ValidationException and the tenant
+            # never gets promoted to running.
+            # definitionally runs this VM (it read the local vm.json), so
+            # this self-heals a record that reached us with host_id
+            # unset/stale (e.g. a dispatch backfill that failed under
+            # throttle) — otherwise a host_id-less `running` tenant makes
+            # delete skip stop-vm/DNAT/counter-release. Gated on `#s = :c`
+            # (creating), so a migrating tenant — never `creating` — is
+            # untouched (no cross-host clobber). We do NOT write vm_num here:
+            # this is the fresh creating→running promote, whose guest_ip is
+            # already correct; the logical(DDB)↔physical(vm.json) vm_num split
+            # capacity_reservation_id:VM 已真起,容量归 running 租户合法持有,后续正常
+            # delete(按 item.vcpu 扣)回收。清掉令牌后,poller/rollback 的失败释放
+            # (条件 capacity_reservation_id=:rid)对已 running 租户落空(no-op)→ 绝不误删
+            # 活租户放置/容量(data-loss 红线)。是控制面 _mark_running 的 host-agent 对偶。
+            update_expr = (
+                "SET #s = :r, vm_health = :vh, app_health = :ah, "
+                "health_failures = :z, last_health_check = :t, "
+                "updated_at = :t, host_private_ip = :hpi, host_id = :self, "
+                "host_port = :hp, guest_ip = :gi"
+            )
+            if via != "fast":
+                update_expr += ", #m = :m"
+            update_expr += " REMOVE capacity_reservation_id"
+            # NOTE (loop 2026-07-01): we tried widening this to
+            # `#s IN (creating, stopped)` to self-heal a "stopped-but-alive"
+            # contradiction, but it RACES fleet-power stop: fleet_power
+            # reconciles DDB→stopped immediately (async SSM not yet run), then
+            # this poll sees the VM still up (SSM hasn't stopped it) + DDB
+            # stopped and pulls it back to running — so after stop-vm finally
+            # writes .stopped, the VM is stopped but DDB stays running forever.
+            # That regression hits EVERY normal fleet-power stop, far worse
+            # than the rare stopped-but-alive edge (only when stop's SSM fails
+            # on a host). So promotion stays creating→running ONLY. The
+            # stopped-but-alive edge is a known limitation to fix later with a
+            # mechanism that doesn't collide with the stop path (e.g. a
+            # grace-timed sweep keyed on the missing .stopped marker).
+            update_vals = {
+                ":r": "running",
+                ":c": "creating",
+                ":vh": info["vm_health"],
+                ":ah": info["app_health"],
+                ":z": 0,
+                ":t": now,
+                ":hpi": host_private_ip,
+                ":hp": int(host_port),
+                ":gi": info["guest_ip"],
+                ":self": INSTANCE_ID,
+            }
+            names = {"#s": "status"}
+            if via != "fast":
+                update_vals[":m"] = metrics or {}
+                names["#m"] = "metrics"
+            # 重投【落回同一 host】拿【新】预留(新 vm_num N2,vm_num 单调不复用),此时本机
+            # 若残留【旧】vm.json(旧 vm_num N1)会把 N2 的租户按 N1 promote → DDB 放置与实跑
+            # VM 的 vm_num 分叉。加 vm_num=:phys 闸:只 promote 【DDB vm_num == 本机 vm.json
+            # vm_num】的租户,旧 vm.json 的 N1≠N2 → 条件失败跳过(等旧 VM 被 orphan-reap 清)。
+            # phys_vm_num 缺失(legacy vm.json 无 vm_num)→ 回落仅 host_id 闸(不比现状差)。
+            _phys = info.get("phys_vm_num")
+            if _phys is not None:
+                promote_cond = (
+                    "#s = :c AND host_id = :self AND vm_num = :phys "
+                    "AND attribute_not_exists(dispatch_settle)"
+                )
+                update_vals[":phys"] = int(_phys)
+            else:
+                promote_cond = (
+                    "#s = :c AND host_id = :self "
+                    "AND attribute_not_exists(dispatch_settle)"
+                )
+            # 释放清了 host_id/token/容量但留 status=creating,本 promote 若只判 #s=:c 会把
+            # 已释放的租户"复活"成 running,而容量已扣 → 未记账的 running VM(超卖)。fence 加
+            # host_id=:self:promote 的租户来自本机 vm.json(reserve 时 host_id 已原子写成本机),
+            # 队列等待的无 host_id 租户没有本机 vm.json、根本到不了 promote。
             try:
                 table.update_item(
                     Key={"id": tid},
-                    UpdateExpression="SET phys_vm_num = if_not_exists(phys_vm_num, :pvn)",
-                    ConditionExpression="attribute_exists(id)",
-                    ExpressionAttributeValues={":pvn": _pvn},
+                    UpdateExpression=update_expr,
+                    ConditionExpression=promote_cond,
+                    ExpressionAttributeNames=names,
+                    ExpressionAttributeValues=update_vals,
                 )
-                _phys_backfilled.add(tid)
+                _observed_status[tid] = "running"
+                print(
+                    f"promoted {tid} creating → running "
+                    f"(host={host_private_ip}:{host_port} guest={info['guest_ip']}"
+                    f" via={via})"
+                )
             except table.meta.client.exceptions.ConditionalCheckFailedException:
-                _phys_backfilled.add(tid)  # 租户已删,别再试
-            except Exception as e:
-                print(f"phys_vm_num backfill {tid} (non-fatal): {e}")
-
-        # Skipped for down/recovering VMs to keep their last-known metrics
-        # rather than overwriting with zeros (which would mask the failure).
-        metrics = None
-        if info["vm_health"] == "up":
-            sock_file = os.path.join(VM_DIR, tid, "fc.sock")
-            data_file = os.path.join(VM_DIR, tid, "data.ext4")
-            cfg_file = os.path.join(VM_DIR, tid, "vm.json")
-            vm_mem_mb = 4096
-            vm_vcpu = 1
-            try:
-                with open(cfg_file, encoding="utf-8") as f:
-                    cfg = json.load(f)
-                    vm_mem_mb = cfg.get("mem_mb", 4096)
-                    vm_vcpu = cfg.get("vcpu", 1) or 1
-            except Exception:
+                # Health was already refreshed. The status/owner may have
+                # changed since that write, or vm_num/dispatch_settle may still
+                # block promotion. Keep every CAS guard and retry next poll.
                 pass
-            fc_pid = info.get("fc_pid")
-            try:
-                metrics = _compose_metrics(
-                    tid, vm_mem_mb, sock_file, data_file, fc_pid=fc_pid, vcpu=vm_vcpu
-                )
-            except Exception as e:
-                print(f"compose_metrics {tid}: {e}")
-            # Mirror computed metrics back into the in-memory snapshot so
-            # the Prometheus exporter (/metrics endpoint scraped by ADOT
-            # → AMP) sees the actual per-VM gauges. Without this only
-            # vm_health was being exposed, leaving openclaw_vm_memory_used_mb
-            # / disk_used_mb / disk_used_pct etc. empty in AMP. (Companion
-            # fix to the 8899/9090 port-mismatch — both shipped 1.2.5.)
-            if metrics is not None:
-                info["metrics"] = metrics
-
-        try:
-            # gateway 崩溃重启(schema fail-closed 拒未知 key 等)的 VM 冒充 running——
-            # ping 通但 gateway HTTP server 挂,租户对外全 502 却报 running(实测 gateway
-            # 崩 2715 次仍 running)。promote 要 VM 活(ping)且 gateway 活(18789 端口有
-            # HTTP 应答,见上面 app_health 探测:不探版本相关的具体路由,只判 HTTP server
-            # 是否应答,兼容 openclaw 2.26 无 /healthz 端点全 404 的情况)。
-            # 只 ping 通、gateway 未起的 VM 停在 creating,由 else 分支刷 health 字段,
-            # 下 tick 再 promote(不 promote ≠ 报错,只是等 gateway 就绪)。
-            if info["vm_health"] == "up" and info["app_health"] == "up":
-                # P2b (contract §3/§4): allocate host_port + write DNAT +
-                # publish Redis route BEFORE promoting. If port alloc fails
-                # (bitmap exhausted or iptables broke), skip promotion this
-                # tick — the next probe will retry. gateway_token is P1's
-                # concern (control-plane pre-mints ciphertext into DDB at
-                # create); host-agent no longer SSH-reads it (§4).
-                try:
-                    host_private_ip, host_port = _ensure_route(tid, info["guest_ip"])
-                except Exception as e:
-                    print(f"ensure_route {tid} failed (skip promote this tick): {e}")
-                    # tenant stuck at creating; counting only one under-reports.
-                    with _lock:
-                        _agent_metrics["route_ensure_failures"] += 1
-                    continue
-                if not host_private_ip or host_port is None:
-                    print(f"ensure_route {tid} degraded (host_ip or port missing)")
-                    with _lock:
-                        _agent_metrics["route_ensure_failures"] += 1
-                    continue
-                # NOTE: `metrics` is a DynamoDB reserved keyword, so it must be
-                # referenced via an ExpressionAttributeNames placeholder (#m).
-                # Same for `status` (#s, already aliased). Without #m the
-                # update_item call returns ValidationException and the tenant
-                # never gets promoted to running.
-                # definitionally runs this VM (it read the local vm.json), so
-                # this self-heals a record that reached us with host_id
-                # unset/stale (e.g. a dispatch backfill that failed under
-                # throttle) — otherwise a host_id-less `running` tenant makes
-                # delete skip stop-vm/DNAT/counter-release. Gated on `#s = :c`
-                # (creating), so a migrating tenant — never `creating` — is
-                # untouched (no cross-host clobber). We do NOT write vm_num here:
-                # this is the fresh creating→running promote, whose guest_ip is
-                # already correct; the logical(DDB)↔physical(vm.json) vm_num split
-                # capacity_reservation_id:VM 已真起,容量归 running 租户合法持有,后续正常
-                # delete(按 item.vcpu 扣)回收。清掉令牌后,poller/rollback 的失败释放
-                # (条件 capacity_reservation_id=:rid)对已 running 租户落空(no-op)→ 绝不误删
-                # 活租户放置/容量(data-loss 红线)。是控制面 _mark_running 的 host-agent 对偶。
-                update_expr = (
-                    "SET #s = :r, vm_health = :vh, app_health = :ah, "
-                    "health_failures = :z, last_health_check = :t, "
-                    "updated_at = :t, host_private_ip = :hpi, host_id = :self, "
-                    "host_port = :hp, guest_ip = :gi, #m = :m "
-                    "REMOVE capacity_reservation_id"
-                )
-                # NOTE (loop 2026-07-01): we tried widening this to
-                # `#s IN (creating, stopped)` to self-heal a "stopped-but-alive"
-                # contradiction, but it RACES fleet-power stop: fleet_power
-                # reconciles DDB→stopped immediately (async SSM not yet run), then
-                # this poll sees the VM still up (SSM hasn't stopped it) + DDB
-                # stopped and pulls it back to running — so after stop-vm finally
-                # writes .stopped, the VM is stopped but DDB stays running forever.
-                # That regression hits EVERY normal fleet-power stop, far worse
-                # than the rare stopped-but-alive edge (only when stop's SSM fails
-                # on a host). So promotion stays creating→running ONLY. The
-                # stopped-but-alive edge is a known limitation to fix later with a
-                # mechanism that doesn't collide with the stop path (e.g. a
-                # grace-timed sweep keyed on the missing .stopped marker).
-                update_vals = {
-                    ":r": "running",
-                    ":c": "creating",
-                    ":vh": info["vm_health"],
-                    ":ah": info["app_health"],
-                    ":z": 0,
-                    ":t": now,
-                    ":hpi": host_private_ip,
-                    ":hp": int(host_port),
-                    ":gi": info["guest_ip"],
-                    ":self": INSTANCE_ID,
-                    ":m": metrics or {},
-                }
-                # 重投【落回同一 host】拿【新】预留(新 vm_num N2,vm_num 单调不复用),此时本机
-                # 若残留【旧】vm.json(旧 vm_num N1)会把 N2 的租户按 N1 promote → DDB 放置与实跑
-                # VM 的 vm_num 分叉。加 vm_num=:phys 闸:只 promote 【DDB vm_num == 本机 vm.json
-                # vm_num】的租户,旧 vm.json 的 N1≠N2 → 条件失败跳过(等旧 VM 被 orphan-reap 清)。
-                # phys_vm_num 缺失(legacy vm.json 无 vm_num)→ 回落仅 host_id 闸(不比现状差)。
-                _phys = info.get("phys_vm_num")
-                if _phys is not None:
-                    promote_cond = (
-                        "#s = :c AND host_id = :self AND vm_num = :phys "
-                        "AND attribute_not_exists(dispatch_settle)"
-                    )
-                    update_vals[":phys"] = int(_phys)
-                else:
-                    promote_cond = (
-                        "#s = :c AND host_id = :self "
-                        "AND attribute_not_exists(dispatch_settle)"
-                    )
-                # 释放清了 host_id/token/容量但留 status=creating,本 promote 若只判 #s=:c 会把
-                # 已释放的租户"复活"成 running,而容量已扣 → 未记账的 running VM(超卖)。fence 加
-                # host_id=:self:promote 的租户来自本机 vm.json(reserve 时 host_id 已原子写成本机),
-                # 队列等待的无 host_id 租户没有本机 vm.json、根本到不了 promote。
-                try:
-                    table.update_item(
-                        Key={"id": tid},
-                        UpdateExpression=update_expr,
-                        ConditionExpression=promote_cond,
-                        ExpressionAttributeNames={"#s": "status", "#m": "metrics"},
-                        ExpressionAttributeValues=update_vals,
-                    )
-                    print(
-                        f"promoted {tid} creating → running "
-                        f"(host={host_private_ip}:{host_port} guest={info['guest_ip']})"
-                    )
-                except table.meta.client.exceptions.ConditionalCheckFailedException:
-                    # promote's `#s = :c AND host_id = :self` lost: tenant is already
-                    # running (normal — just refresh), deleted / migrated away, OR
-                    # 【绝不复活】。回落 guarded refresh(attribute_exists(id) + host_id);
-                    # 已释放租户 host_id 没了 → refresh 的 host_id 守卫也 CCF → 干净 no-op。
-                    #
-                    # #526 —— 这条分支正是【已 running 的租户每 tick 走的路】,而 host_port
-                    # 已由上方 _ensure_route 算出真值。restore 过的租户 DDB 里存的是控制面
-                    # legacy 公式的产物(从未落到 iptables),在此顺带对账回真值:漂移一个 tick
-                    # 内自动收敛,存量错值也一并自愈。promote 那条 `#s = :c` 闸门永远命中不到
-                    # 它们,所以必须在这条回落路径上修。
-                    _refresh_health(table, tid, info, now, metrics, host_port=host_port)
-            else:
-                # Not promoted this tick (still creating w/ gateway not up, or a
-                # health-only refresh for a down VM). Reconcile + guard in the
-                # shared helper (attribute_exists(id) + host_id ownership).
-                _refresh_health(table, tid, info, now, metrics)
-        except Exception as e:
-            # Expected here: _refresh_health's CCF for a deleted / migrated-away
-            # tenant (its guard failed cleanly), plus any transient DDB error.
-            # Logged, never crashes the poll loop.
-            print(f"ddb update {tid}: {e}")
+        else:
+            # Not promoted this tick (still creating w/ gateway not up, or a
+            # health-only refresh for a down VM). Reconcile + guard in the
+            # shared helper (attribute_exists(id) + host_id ownership).
+            _observed_status[tid] = _refresh_health(table, tid, info, now, metrics)
+    except table.meta.client.exceptions.ConditionalCheckFailedException as e:
+        # The health write's guard failed: the tenant is deleted or owned by another
+        # host. Not a fast-promote candidate until a later write says otherwise.
+        _observed_status[tid] = "not-ours"
+        print(f"ddb update {tid}: {e}")
+    except Exception as e:
+        # Expected here: _refresh_health's CCF for a deleted / migrated-away
+        # tenant (its guard failed cleanly), plus any transient DDB error.
+        # Logged, never crashes the poll loop.
+        print(f"ddb update {tid}: {e}")
 
 
 # ═══════════════════════════════════════════
@@ -1821,6 +2183,27 @@ def _get_disk_usage(data_file):
         return 0, 0, 0
 
 
+def _balloon_available_mib(stats):
+    """Guest available memory in MiB from BalloonStats, or None if unusable.
+
+    `available_memory` is a TOP-LEVEL field of BalloonStats (Firecracker v1.15.1
+    swagger), in bytes. It is only populated when the device was configured
+    pre-boot with stats_polling_interval_s > 0 AND the guest driver negotiated
+    the stats virtqueue. Returns None — never 0 — when the value is absent or
+    non-positive, because "missing" and "zero free memory" must not collapse
+    into the same decision.
+    """
+    available_bytes = stats.get("available_memory") if isinstance(stats, dict) else None
+    if (
+        not isinstance(available_bytes, (int, float))
+        or isinstance(available_bytes, bool)
+        or available_bytes <= 0
+    ):
+        return None
+    available_mib = int(available_bytes) // (1024 * 1024)
+    return available_mib if available_mib > 0 else None
+
+
 def _get_memory_usage(stats, vm_mem_mb):
     """Compute (used_mb, balloon_mib) from balloon /statistics response.
 
@@ -1830,10 +2213,11 @@ def _get_memory_usage(stats, vm_mem_mb):
     """
     if not stats:
         return 0, 0
-    available_bytes = stats.get("stats", {}).get("available_memory", 0)
-    available_mb = available_bytes // (1024 * 1024)
-    used_mb = max(0, vm_mem_mb - available_mb)
     balloon_mib = stats.get("actual_mib", 0)
+    available_mb = _balloon_available_mib(stats)
+    if available_mb is None:
+        return 0, balloon_mib
+    used_mb = max(0, vm_mem_mb - available_mb)
     return used_mb, balloon_mib
 
 
@@ -2040,13 +2424,15 @@ def _get_balloon_stats(sock_file):
             [
                 "curl",
                 "-sf",
+                "--max-time",
+                str(BALLOON_API_TIMEOUT_SEC),
                 "--unix-socket",
                 sock_file,
                 "http://localhost/balloon/statistics",
             ],
             capture_output=True,
             text=True,
-            timeout=5,
+            timeout=BALLOON_API_TIMEOUT_SEC + 1,
         )
         if r.returncode == 0 and r.stdout.strip():
             return json.loads(r.stdout)
@@ -2056,12 +2442,21 @@ def _get_balloon_stats(sock_file):
 
 
 def _set_balloon_target(sock_file, amount_mib):
-    """Set balloon target size (inflate/deflate)."""
+    """Set balloon target size (inflate/deflate). True only on HTTP success.
+
+    `curl -sf` already returns non-zero on a 4xx/5xx, but the result used to be
+    discarded, so a persistently failing PATCH looked exactly like a working one:
+    the caller logged the new target and counted an action. That is the same
+    silent-failure-with-green-telemetry shape this controller exists to remove,
+    so the return code is now the caller's gate.
+    """
     try:
-        subprocess.run(
+        r = subprocess.run(
             [
                 "curl",
                 "-sf",
+                "--max-time",
+                str(BALLOON_API_TIMEOUT_SEC),
                 "--unix-socket",
                 sock_file,
                 "-X",
@@ -2073,10 +2468,19 @@ def _set_balloon_target(sock_file, amount_mib):
                 json.dumps({"amount_mib": amount_mib}),
             ],
             capture_output=True,
-            timeout=5,
+            timeout=BALLOON_API_TIMEOUT_SEC + 1,
         )
     except Exception as e:
         print(f"balloon set failed: {e}")
+        return False
+    if r.returncode != 0:
+        detail = (r.stderr or b"").decode(errors="replace").strip()
+        print(
+            f"balloon set failed: PATCH amount_mib={amount_mib} on {sock_file} "
+            f"exited {r.returncode} {detail}"
+        )
+        return False
+    return True
 
 
 def _get_host_mem_info():
@@ -2095,71 +2499,384 @@ def _get_host_mem_info():
         return 0, 0
 
 
+def _balloon_vm_state(tid, info):
+    """Return balloon inputs for an eligible VM, or None when it must be skipped."""
+    if info.get("vm_health") != "up":
+        return None
+    sock_file = os.path.join(VM_DIR, tid, "fc.sock")
+    if not os.path.exists(sock_file):
+        return None
+
+    cfg_file = os.path.join(VM_DIR, tid, "vm.json")
+    try:
+        with open(cfg_file, encoding="utf-8") as f:
+            cfg = json.load(f)
+        vm_mem_mb = cfg.get("mem_mb", 4096)
+    except Exception:
+        return None
+
+    stats = _get_balloon_stats(sock_file)
+    if not stats:
+        print(f"balloon stats unavailable {tid}: cannot inspect balloon state")
+        _balloon_cycle["stats_unavailable"] += 1
+        return None
+    # Count an unusable available_memory here rather than inside the inflate
+    # path: the inflate path only runs under host pressure, so an operator
+    # would not learn that the signal is broken until the moment it is needed.
+    # This gauge exists to surface exactly that, so it must be branch-independent.
+    if _balloon_available_mib(stats) is None:
+        _balloon_cycle["stats_unavailable"] += 1
+    current_balloon_mib = int(stats.get("actual_mib", 0) or 0)
+    _balloon_cycle["actual_mib"] += current_balloon_mib
+    return sock_file, vm_mem_mb, stats, current_balloon_mib
+
+
+def _fc_identity(info):
+    """(pid, start_ticks) for this tenant's Firecracker, or None when unreadable.
+
+    A PID alone is not an identity: PIDs are reused, and `fc.sock` lives at a fixed
+    path per tenant, so a VM that is stopped and relaunched between building a work
+    list and acting on it is reachable at the same socket. Pairing the PID with its
+    process start time makes "same incarnation" checkable.
+    """
+    fc_pid = info.get("fc_pid")
+    if not fc_pid:
+        return None
+    ticks = _read_proc_start_ticks(fc_pid)
+    if ticks is None:
+        return None
+    return (int(fc_pid), ticks)
+
+
+def _balloon_inflate_converged(tid, stats):
+    """Gate for RAISING a target only. Deflation must never be gated on this.
+
+    Raising a target while the guest driver is still climbing toward the previous
+    one makes the driver spin in its `Out of puff! Can't get %d pages` retry loop,
+    so inflation waits. Lowering a target is the opposite: it is the relief
+    operation. With `deflate_on_oom=true` the guest kernel takes pages back out of
+    the balloon under memory pressure, which drives `actual_mib` BELOW `target_mib`
+    on its own — if that state also blocked deflation, the controller could never
+    lower the target the guest cannot reach, and the VM would stay pinned against
+    an unreachable target indefinitely. So the deflate path proceeds from
+    `actual_mib`, which converges the target down to what the guest actually holds.
+    """
+    target_mib = int(stats.get("target_mib", 0) or 0)
+    actual_mib = int(stats.get("actual_mib", 0) or 0)
+    if abs(target_mib - actual_mib) <= BALLOON_CONVERGE_TOLERANCE_MIB:
+        return True
+    print(
+        f"balloon inflate skip {tid}: target={target_mib}MiB actual={actual_mib}MiB "
+        f"not converged (tolerance={BALLOON_CONVERGE_TOLERANCE_MIB}MiB)"
+    )
+    return False
+
+
+def _inflate_balloon(tid, sock_file, vm_mem_mb, stats, host_available, identity=None):
+    """Raise this VM's balloon target by one clamped step. True only if a PATCH landed.
+
+    Holds the per-tenant lifecycle lock across re-read, identity check and PATCH, for
+    the same reason the deflate path does — and the consequence here is worse. The step
+    is computed as `actual_mib + step`, so if the VM were replaced between the staged
+    read and the PATCH, a fresh VM sitting at `actual_mib=0` would receive the previous
+    incarnation's accumulated target plus a step in a single write, blowing straight
+    past the one-step limit and the ratio cap and squeezing a guest that asked for
+    nothing.
+    """
+    lock_fd = _acquire_tenant_lock(tid, wait_sec=0, who="balloon")
+    if lock_fd is None:
+        _balloon_cycle["lock_contended"] += 1
+        return False
+    try:
+        return _inflate_balloon_locked(
+            tid, sock_file, vm_mem_mb, stats, host_available, identity
+        )
+    finally:
+        try:
+            os.close(lock_fd)  # closing the fd releases the flock
+        except OSError:
+            pass
+
+
+def _inflate_balloon_locked(tid, sock_file, vm_mem_mb, stats, host_available, identity):
+    if identity is not None:
+        fresh_ticks = _read_proc_start_ticks(identity[0])
+        if fresh_ticks is None or fresh_ticks != identity[1]:
+            print(
+                f"balloon inflate skip {tid}: VM identity changed "
+                f"pid={identity[0]} start_ticks {identity[1]}→{fresh_ticks}, "
+                "staged step discarded"
+            )
+            return False
+    fresh = _get_balloon_stats(sock_file)
+    if not fresh:
+        print(f"balloon inflate skip {tid}: statistics unreadable at apply time")
+        return False
+    if not _balloon_inflate_converged(tid, fresh):
+        return False
+    stats = fresh
+    current_balloon_mib = int(stats.get("actual_mib", 0) or 0)
+    cap = int(vm_mem_mb * BALLOON_MAX_INFLATE_RATIO)
+    available_mib = _balloon_available_mib(stats)
+    if available_mib is None:
+        # Already counted in _balloon_vm_state — warn only, do not double count.
+        print(
+            f"balloon stats unavailable {tid}: cannot size inflate safely "
+            "(available_memory missing or non-positive)"
+        )
+        if not BALLOON_ALLOW_BLIND_INFLATE:
+            return False
+        step = min(BALLOON_STEP_MIB, cap - current_balloon_mib)
+        reason = "blind_opt_in"
+        guest_available = "unavailable"
+    else:
+        headroom = (
+            available_mib
+            - BALLOON_MIN_GUEST_AVAILABLE_MB
+            - BALLOON_CUSHION_MIB
+        )
+        step = min(
+            BALLOON_STEP_MIB,
+            cap - current_balloon_mib,
+            max(0, headroom),
+        )
+        reason = "guest_headroom"
+        guest_available = f"{available_mib}MB"
+    if step <= 0:
+        return False
+
+    target = current_balloon_mib + step
+    if not _set_balloon_target(sock_file, target):
+        # Failure already logged by _set_balloon_target. Report no action so the
+        # cycle budget and the actions gauge count landed PATCHes, not attempts.
+        return False
+    print(
+        f"balloon inflate {tid}: {current_balloon_mib}→{target}MB "
+        f"(step={step}MB reason={reason} host_avail={host_available}MB "
+        f"guest_avail={guest_available})"
+    )
+    return True
+
+
+def _deflate_balloon_batch(candidates, host_available, deadline=None):
+    remaining_budget = max(
+        0, BALLOON_MAX_ACTIONS_PER_CYCLE - _balloon_cycle["actions"]
+    )
+    want = min(BALLOON_DEFLATE_BATCH, remaining_budget)
+    if candidates and want <= 0:
+        print("balloon action budget exhausted for this cycle")
+        return
+    required_mib = min(want, len(candidates)) * BALLOON_STEP_MIB
+    if host_available < required_mib:
+        print(
+            f"balloon deflate skipped: host_avail={host_available}MB cannot "
+            f"absorb batch={min(want, len(candidates))} "
+            f"step={BALLOON_STEP_MIB}MB required={required_mib}MB"
+        )
+        return
+    # Walk past failures until `want` PATCHes have LANDED, rather than slicing a
+    # fixed prefix: a VM whose PATCH always fails (wedged API socket, or no balloon
+    # device at all because the pre-boot PUT failed) would otherwise sit at the head
+    # of a stably-ordered list and starve every tenant behind it, forever.
+    #
+    # But the walk is bounded by BALLOON_MAX_ATTEMPTS_PER_CYCLE, because each failing
+    # PATCH can burn curl's --max-time and this runs inline in _poll_loop; an
+    # unbounded walk over a large failing fleet would stall the heartbeat and the DDB
+    # reconcile. Bounding alone would let a wedged head eat the attempt budget every
+    # cycle, so the start offset rotates — over consecutive cycles every candidate
+    # gets a turn.
+    global _balloon_deflate_cursor
+    total = len(candidates)
+    if not total:
+        return
+    start = _balloon_deflate_cursor % total
+    ordered = candidates[start:] + candidates[:start]
+    done = 0
+    attempts = 0
+    for tid, sock_file, staged_mib, identity in ordered:
+        if done >= want or attempts >= BALLOON_MAX_ATTEMPTS_PER_CYCLE:
+            break
+        if deadline is not None and time.monotonic() >= deadline:
+            print("balloon deflate stopped: cycle time budget reached")
+            break
+        attempts += 1
+        # Hold the per-tenant lifecycle lock across re-read, identity check and PATCH.
+        # Re-reading alone narrows the window but does not close it: launch/stop/
+        # delete/migrate all take this same flock, so taking it non-blocking here is
+        # what makes "the VM cannot be replaced under us mid-decision" true rather
+        # than merely unlikely. wait_sec=0 because the agent is a single-threaded tick
+        # loop — never block it; a busy tenant is simply skipped this cycle.
+        lock_fd = _acquire_tenant_lock(tid, wait_sec=0, who="balloon")
+        if lock_fd is None:
+            # Count it. A tenant whose lock is held every cycle would otherwise be
+            # invisible — the controller would look healthy while never touching it,
+            # which is the exact failure shape this controller was rewritten to end.
+            # Not logged per occurrence: at a 5s cadence that would be pure spam.
+            _balloon_cycle["lock_contended"] += 1
+            continue  # someone is mid-lifecycle on this tenant; next cycle
+        try:
+            fresh = _get_balloon_stats(sock_file)
+            if not fresh:
+                print(
+                    f"balloon deflate skip {tid}: statistics unreadable at apply time"
+                )
+                continue
+            if identity is not None:
+                fresh_ticks = _read_proc_start_ticks(identity[0])
+                if fresh_ticks is None or fresh_ticks != identity[1]:
+                    print(
+                        f"balloon deflate skip {tid}: VM identity changed "
+                        f"pid={identity[0]} start_ticks {identity[1]}→{fresh_ticks}, "
+                        "stale target discarded"
+                    )
+                    continue
+            fresh_mib = int(fresh.get("actual_mib", 0) or 0)
+            fresh_target = int(fresh.get("target_mib", 0) or 0)
+            if fresh_mib <= 0 and fresh_target <= 0:
+                continue  # nothing left to lower
+            new_target = max(0, fresh_mib - BALLOON_STEP_MIB)
+            # Deflation must NEVER raise the current target. The `fresh_target > 0`
+            # qualifier that used to guard this was the hole: with target already at
+            # 0 and the guest still holding pages (actual_mib > step, drain in
+            # flight), `new_target` is positive, the qualifier short-circuited the
+            # guard, and the PATCH would push the target back UP — reversing a full
+            # deflate already underway.
+            if new_target >= fresh_target:
+                continue  # would not lower anything
+            if not _set_balloon_target(sock_file, new_target):
+                continue  # failure already logged; do not count an action
+            done += 1
+            _balloon_cycle["actions"] += 1
+            print(
+                f"balloon deflate {tid}: {fresh_mib}→{new_target}MB "
+                f"(step={fresh_mib - new_target}MB staged={staged_mib}MB "
+                f"host_avail={host_available}MB)"
+            )
+        finally:
+            try:
+                os.close(lock_fd)  # closing the fd releases the flock
+            except OSError:
+                pass
+    _balloon_deflate_cursor = (start + attempts) % total
+    if attempts >= BALLOON_MAX_ATTEMPTS_PER_CYCLE and done < want:
+        print(
+            f"balloon deflate attempt budget reached: attempts={attempts} "
+            f"landed={done} cursor={_balloon_deflate_cursor}/{total}"
+        )
+    if _balloon_cycle["actions"] >= BALLOON_MAX_ACTIONS_PER_CYCLE:
+        print("balloon action budget exhausted for this cycle")
+
+
 def _adjust_balloons(probe_results):
     """Dynamically adjust balloon sizes based on host memory pressure.
 
     Strategy:
     - If host available memory < 20% of total → inflate balloons on VMs with spare memory
-    - If host available memory > 40% of total → deflate balloons to give memory back
+    - If host available memory > 40% of total → deflate balloons, stepwise, in batches
     - Never inflate beyond max_inflate_ratio of VM's declared memory
-    - Never reduce guest available below min_guest_available_mb
+    - Never reduce guest available below min_guest_available_mb (+ cushion)
+    - One step is at most BALLOON_STEP_MIB; a VM whose target and actual have not
+      converged is skipped, because Firecracker cannot control how fast the guest
+      driver reaches a target and stacking targets makes the driver spin
+    - Both directions share BALLOON_MAX_ACTIONS_PER_CYCLE, and deflate never
+      zeroes every target at once — the host must be able to absorb what is
+      handed back to the guests
+    - A missing or unusable available_memory is reported, never treated as zero
     """
     if not BALLOON_ENABLED:
         return
 
+    _balloon_cycle.update(
+        actions=0, stats_unavailable=0, actual_mib=0, lock_contended=0
+    )
     host_total, host_available = _get_host_mem_info()
     if host_total == 0:
         return
 
     host_pressure = host_available / host_total  # 0.0 = no memory, 1.0 = all free
+    deflate_candidates = []
+    deadline = time.monotonic() + BALLOON_CYCLE_BUDGET_SEC
 
-    for tid, info in probe_results.items():
-        if info.get("vm_health") != "up":
+    # Rotate the scan start so a pass cut short by the time budget resumes where it
+    # stopped. Without this, a fleet whose first VMs have slow sockets would consume
+    # the whole budget every cycle and the tail would never be looked at.
+    global _balloon_scan_cursor
+    tids = list(probe_results)
+    scan_start = _balloon_scan_cursor % len(tids) if tids else 0
+    tids = tids[scan_start:] + tids[:scan_start]
+    scanned = 0
+    inflate_attempts = 0
+
+    for tid in tids:
+        if time.monotonic() >= deadline:
+            print(
+                f"balloon cycle time budget {BALLOON_CYCLE_BUDGET_SEC}s reached after "
+                f"{scanned}/{len(tids)} VMs; the rest resume next cycle"
+            )
+            break
+        scanned += 1
+        info = probe_results[tid]
+        state = _balloon_vm_state(tid, info)
+        if state is None:
             continue
-        sock_file = os.path.join(VM_DIR, tid, "fc.sock")
-        if not os.path.exists(sock_file):
-            continue
-
-        # Read VM config for declared memory
-        cfg_file = os.path.join(VM_DIR, tid, "vm.json")
-        try:
-            with open(cfg_file, encoding="utf-8") as f:
-                cfg = json.load(f)
-            vm_mem_mb = cfg.get("mem_mb", 4096)
-        except Exception:
-            continue
-
-        stats = _get_balloon_stats(sock_file)
-        if not stats:
-            continue
-
-        current_balloon_mib = stats.get("actual_mib", 0)
-        max_balloon = int(vm_mem_mb * BALLOON_MAX_INFLATE_RATIO)
-
-        # Guest available memory (from balloon stats)
-        guest_available_mb = stats.get("stats", {}).get("available_memory", 0) // (
-            1024 * 1024
-        )
+        sock_file, vm_mem_mb, stats, current_balloon_mib = state
 
         if host_pressure < 0.20:
-            # Host under pressure — try to reclaim from this VM
-            reclaimable = guest_available_mb - BALLOON_MIN_GUEST_AVAILABLE_MB
-            if reclaimable > 0:
-                target = min(current_balloon_mib + reclaimable, max_balloon)
-                if target > current_balloon_mib:
-                    _set_balloon_target(sock_file, target)
-                    print(
-                        f"balloon inflate {tid}: {current_balloon_mib}→{target}MB "
-                        f"(host_avail={host_available}MB guest_avail={guest_available_mb}MB)"
-                    )
-
-        elif host_pressure > 0.40:
-            # Host has plenty of memory — give back to VMs
-            if current_balloon_mib > 0:
-                _set_balloon_target(sock_file, 0)
+            if not _balloon_inflate_converged(tid, stats):
+                continue
+            if _balloon_cycle["actions"] >= BALLOON_MAX_ACTIONS_PER_CYCLE:
+                print("balloon action budget exhausted for this cycle")
+                break
+            # Attempts, not just landings: a failing PATCH costs the same wall clock
+            # as a successful one, and only landings incremented `actions`, so a fleet
+            # of failing inflates was unbounded on this path too.
+            if inflate_attempts >= BALLOON_MAX_ATTEMPTS_PER_CYCLE:
                 print(
-                    f"balloon deflate {tid}: {current_balloon_mib}→0MB (host_avail={host_available}MB)"
+                    f"balloon inflate attempt budget reached: attempts="
+                    f"{inflate_attempts} landed={_balloon_cycle['actions']}"
                 )
+                break
+            inflate_attempts += 1
+            if _inflate_balloon(
+                tid,
+                sock_file,
+                vm_mem_mb,
+                stats,
+                host_available,
+                _fc_identity(info),
+            ):
+                _balloon_cycle["actions"] += 1
+        elif host_pressure > 0.40 and (
+            current_balloon_mib > 0 or int(stats.get("target_mib", 0) or 0) > 0
+        ):
+            # No convergence gate here on purpose — see _balloon_inflate_converged.
+            # current_balloon_mib is actual_mib, so a target the guest never reached
+            # (deflate_on_oom, or an operator-set target) still gets walked down.
+            # `target_mib > 0` with `actual_mib == 0` is the worst case: the guest
+            # handed everything back but the target still says otherwise, so the
+            # driver keeps chasing it. Stepping down from actual cancels it.
+            deflate_candidates.append(
+                (tid, sock_file, current_balloon_mib, _fc_identity(info))
+            )
+
+    _balloon_scan_cursor = (scan_start + scanned) % len(tids) if tids else 0
+
+    if host_pressure > 0.40:
+        # Fresh deadline, not the scan's: see BALLOON_ACTION_BUDGET_SEC.
+        _deflate_balloon_batch(
+            deflate_candidates,
+            host_available,
+            time.monotonic() + BALLOON_ACTION_BUDGET_SEC,
+        )
+
+    # Publish by rebinding a module global (atomic under the GIL) instead of
+    # letting /metrics read the live accumulator. A scrape that landed mid-cycle
+    # would otherwise see the post-reset zeros — and this gauge group exists
+    # precisely so that "stats_unavailable > 0" is visible, so a transient 0
+    # would defeat it. Stays None until the first cycle finishes: no fake zeros,
+    # same convention as port_stats above.
+    global _balloon_metrics
+    _balloon_metrics = dict(_balloon_cycle)
 
 
 
@@ -4446,6 +5163,215 @@ def _reconcile_egress():
         )
 
 
+def _fast_promote_candidates(now_epoch):
+    """Recently launched VMs whose last observed status is creating (or not seen yet)."""
+    try:
+        entries = os.listdir(VM_DIR)
+    except FileNotFoundError:
+        return []
+    mono = time.monotonic()
+    out = []
+    for tid in entries:
+        if _observed_status.get(tid, "creating") != "creating":
+            continue
+        vm_path = os.path.join(VM_DIR, tid)
+        if mono < _fast_retry_at.get(tid, 0):
+            # One read: the poll thread may clear the back-off between two.
+            backed_off_for = _fast_backoff_fc.get(tid)
+            if backed_off_for is None or _fc_sock_id(vm_path) == backed_off_for:
+                continue
+            _clear_fast_back_off(tid)  # a new Firecracker: its own grace, from now
+        try:
+            mtime = os.stat(os.path.join(vm_path, "vm.json")).st_mtime
+        except OSError:
+            continue
+        if now_epoch - mtime > FAST_PROMOTE_WINDOW_SEC:
+            continue
+        if os.path.exists(os.path.join(vm_path, ".stopped")):
+            continue
+        out.append(tid)
+    return out
+
+
+def _fast_probe(tid, pid_index):
+    """Probe result if the VM and its gateway are both up, else None.
+
+    Read-only: recovery, relaunch and net-dead counting stay with the poll loop.
+    """
+    probed_at = time.monotonic()
+    vm_path = os.path.join(VM_DIR, tid)
+    try:
+        with open(os.path.join(vm_path, "vm.json"), encoding="utf-8") as f:
+            cfg = json.load(f)
+    except Exception:
+        return None
+    guest_ip = cfg.get("guest_ip", "")
+    fc_pid = pid_index.get(os.path.join(vm_path, "fc.sock"))
+    if not guest_ip or fc_pid is None:
+        return None
+    try:
+        r = subprocess.run(
+            ["ping", "-c", "1", "-W", "1", guest_ip], capture_output=True, timeout=3
+        )
+    except Exception:
+        return None
+    if r.returncode != 0:
+        return None
+    app_health = _probe_app_health(
+        guest_ip, cfg.get("chat_ep", 0), timeout=FAST_PROMOTE_PROBE_TIMEOUT_SEC
+    )
+    if app_health != "up":
+        return None
+    return _probed_result(
+        fc_pid,
+        guest_ip,
+        cfg.get("vm_num"),
+        cfg.get("image_snapshot_time") or "",
+        "up",
+        "up",
+        probed_at,
+    )
+
+
+def _newer_status(current, info):
+    """The /metrics snapshot entry to keep: whichever probe started later."""
+    if current is None:
+        return info
+    old_at = current.get("probed_at")
+    new_at = info.get("probed_at")
+    if old_at is not None and new_at is not None and old_at > new_at:
+        return current
+    return info
+
+
+def _fast_promote_submit(pool, inflight):
+    """Start a probe for every candidate that has none running. Returns how many."""
+    busy = set(inflight.values())
+    candidates = [t for t in _fast_promote_candidates(time.time()) if t not in busy]
+    if not candidates:
+        return 0
+    pid_index = _fc_pid_index()
+    if pid_index is None:
+        return 0
+    # Without a Firecracker process there is nothing to probe, and a leftover fc.sock
+    # says nothing about when one started: wait for it instead of backing off.
+    candidates = [
+        t for t in candidates if os.path.join(VM_DIR, t, "fc.sock") in pid_index
+    ]
+    for tid in candidates:
+        inflight[pool.submit(_fast_probe, tid, pid_index)] = tid
+    return len(candidates)
+
+
+def _fast_promote_write(tid, info):
+    """Promote one ready tenant unless the poll loop is writing it. True if written."""
+    lk = _acquire_tenant_write_lock(tid, blocking=False)
+    if lk is None:
+        return False  # the poll loop is writing this tenant right now
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    try:
+        _write_tenant(_get_ddb().Table(TENANTS_TABLE), tid, info, now, via="fast")
+    finally:
+        lk.release()
+    if _observed_status.get(tid, "creating") == "creating":
+        # Healthy but not promoted: a CAS guard (vm_num, dispatch_settle) or a
+        # route failure is still blocking. Do not rewrite it every second.
+        _fast_retry_at[tid] = time.monotonic() + FAST_PROMOTE_RETRY_SEC
+    with _lock:
+        previous = _status.get(tid)
+        entry = _newer_status(previous, {**info, "updated_at": now})
+        if entry is not previous and previous and "metrics" in previous:
+            # The fast probe collects no metrics: keep the last ones the poll wrote.
+            entry.setdefault("metrics", previous["metrics"])
+        _status[tid] = entry
+    return True
+
+
+def _fast_promote_drain(inflight, timeout):
+    """Write each probe that finishes within timeout, as it finishes. Returns how many."""
+    if not inflight:
+        return 0
+    done, _ = wait(list(inflight), timeout=timeout, return_when=FIRST_COMPLETED)
+    written = 0
+    for fut in done:
+        tid = inflight.pop(fut)
+        try:
+            info = fut.result()
+        except Exception as e:
+            print(f"fast probe {tid}: {e}")
+            info = None
+        if info is None:
+            _fast_back_off(tid)
+            continue
+        _fast_backoff.pop(tid, None)
+        _fast_backoff_fc.pop(tid, None)
+        if _fast_promote_write(tid, info):
+            written += 1
+    return written
+
+
+def _fc_sock_id(vm_path):
+    """(inode, mtime_ns) of a VM's fc.sock, or None. A new Firecracker makes a new one."""
+    try:
+        st = os.stat(os.path.join(vm_path, "fc.sock"))
+    except OSError:
+        return None
+    return (st.st_ino, st.st_mtime_ns)
+
+
+def _clear_fast_back_off(tid):
+    _fast_backoff.pop(tid, None)
+    _fast_backoff_fc.pop(tid, None)
+    _fast_retry_at.pop(tid, None)
+
+
+def _fast_back_off(tid):
+    """Delay the next probe of a candidate that is not ready, once past the grace.
+
+    The grace runs from Firecracker's start (it creates fc.sock), not from vm.json:
+    launch writes vm.json before a download or restore that can outlast the grace.
+    Only a VM with a Firecracker process is probed, so its fc.sock is that process's.
+    The back-off is tied to that fc.sock: a restarted Firecracker gets a fresh grace.
+    """
+    sock_id = _fc_sock_id(os.path.join(VM_DIR, tid))
+    if sock_id is None:
+        return
+    if time.time() - sock_id[1] / 1e9 < FAST_PROMOTE_GRACE_SEC:
+        return
+    if _fast_backoff_fc.get(tid) != sock_id:
+        _fast_backoff.pop(tid, None)
+    delay = min(
+        _fast_backoff.get(tid, FAST_PROMOTE_RETRY_SEC / 2) * 2,
+        FAST_PROMOTE_BACKOFF_MAX_SEC,
+    )
+    _fast_backoff[tid] = delay
+    _fast_backoff_fc[tid] = sock_id
+    _fast_retry_at[tid] = time.monotonic() + delay
+
+
+def _fast_promote_loop():
+    # Probes run on the pool and are written by this thread in completion order,
+    # so one slow gateway never holds back a tenant that is already ready, and a
+    # tenant with a probe still running is not probed again.
+    inflight = {}  # future -> tenant_id
+    next_scan = 0.0
+    with ThreadPoolExecutor(max_workers=max(1, FAST_PROMOTE_PARALLEL)) as pool:
+        while True:
+            try:
+                if time.monotonic() >= next_scan:
+                    next_scan = time.monotonic() + FAST_PROMOTE_INTERVAL
+                    _fast_promote_submit(pool, inflight)
+                    _agent_loop_tick("fast_promote")
+                remaining = max(0.0, next_scan - time.monotonic())
+                if inflight:
+                    _fast_promote_drain(inflight, remaining)
+                else:
+                    time.sleep(remaining)
+            except Exception as e:
+                print(f"fast promote error: {e}")
+                time.sleep(FAST_PROMOTE_INTERVAL)
+
+
 def _poll_loop():
     while True:
         try:
@@ -4453,13 +5379,26 @@ def _poll_loop():
             # don't suppress the host-level liveness signal.
             _write_host_heartbeat()
             _reap_orphan_firecrackers()
+            pass_started = time.monotonic()
             results = _probe_all()
+            present = set(os.listdir(VM_DIR)) if os.path.isdir(VM_DIR) else set()
+            _prune_tenant_state(present)
             ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
             with _lock:
+                previous = dict(_status)
                 _status.clear()
                 for tid, info in results.items():
                     info["updated_at"] = ts
-                    _status[tid] = info
+                    _status[tid] = _newer_status(previous.get(tid), info)
+                # A tenant the fast loop published after this pass listed VM_DIR is
+                # not in results; keep it until a pass that saw it replaces it.
+                for tid, info in previous.items():
+                    if (
+                        tid not in results
+                        and tid in present
+                        and info.get("probed_at", 0) > pass_started
+                    ):
+                        _status[tid] = info
             _write_ddb(results)
             _adjust_balloons(results)
             _probe_ssm_agent()  # #387: cached here, never at scrape time
@@ -4522,7 +5461,7 @@ class Handler(BaseHTTPRequestHandler):
                     port_stats = None
             stranding = _collect_stranding_stats()
             body = _render_metrics_text(
-                data, port_stats, agent_stats, stranding
+                data, port_stats, agent_stats, stranding, _balloon_metrics
             ).encode()
             self.send_response(200)
             self.send_header("Content-Type", "text/plain; version=0.0.4")
@@ -4578,6 +5517,13 @@ def main():
         print(f"port_bitmap startup recovery failed (stays lazy): {e}")
     t = threading.Thread(target=_poll_loop, daemon=True)
     t.start()
+    if FAST_PROMOTE_INTERVAL > 0 and TENANTS_TABLE:
+        print(
+            f"openclaw-agent fast promote: every {FAST_PROMOTE_INTERVAL}s, "
+            f"window={FAST_PROMOTE_WINDOW_SEC}s parallel={FAST_PROMOTE_PARALLEL}"
+        )
+        fp = threading.Thread(target=_fast_promote_loop, daemon=True)
+        fp.start()
     # stuck rm -rf never blocks heartbeat → no false stale-restart).
     g = threading.Thread(target=_disk_gc_loop, daemon=True)
     g.start()

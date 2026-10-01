@@ -66,6 +66,36 @@ publish_stop_intent() {
   STOP_INTENT_PUBLISHED=1
 }
 
+# Remove every filter/nat rule that matches `-i <tap>`: the IMDS / tenant-supernet /
+# Redis / management-port DROPs, the FORWARD ACCEPT, and the egress-allowlist DNS
+# DNAT that launch-vm.sh (and migrate-vm.sh) install per tap. Nothing used to delete
+# them, and vm_num never repeats on a host, so the rule set grew with the host's
+# history: ~13 rules per tap ever launched, which made every later launch slower.
+# Every launch path re-adds them before Firecracker starts, and this runs under
+# the per-tenant lifecycle lock, so the tenant's own launch cannot interleave. The
+# gateway DNAT (`--dport <host_port>`, no -i) is left alone: stop keeps the route.
+purge_tap_rules() {
+  local tap="$1" table rules
+  for table in filter nat; do
+    rules="$(sudo iptables-save -t "${table}" 2>/dev/null |
+      grep -E -- "^-A .* -i ${tap}( |$)" | sed 's/^-A /-D /')" || true
+    [ -n "${rules}" ] || continue
+    if ! printf '*%s\n%s\nCOMMIT\n' "${table}" "${rules}" |
+      sudo iptables-restore --noflush 2>/dev/null; then
+      # One batch is atomic; if it failed, delete what is still there one by one.
+      while IFS= read -r rule; do
+        # shellcheck disable=SC2086  # iptables-save output is already tokenized
+        sudo iptables -w 5 -t "${table}" ${rule} 2>/dev/null || true
+      done <<< "${rules}"
+    fi
+  done
+  local left
+  left="$(sudo iptables-save 2>/dev/null | grep -cE -- " -i ${tap}( |$)")" || true
+  if [ "${left:-0}" -gt 0 ]; then
+    log "WARN: ${left} iptables rules for ${tap} survived cleanup"
+  fi
+}
+
 # ⑰ codex 独立复审第十轮 —— 判"这个进程是不是 Firecracker"必须用 /proc/<pid>/comm,
 # 不能用 exe 的 basename。
 #
@@ -367,7 +397,36 @@ if [ "${LEGACY_FIRECRACKER_TERMINATED}" -eq 0 ]; then
   pkill -KILL -f "api-sock ${VM_DIR}/fc.sock" 2>/dev/null || true
 fi
 # 4) Clean up the host-side network + sockets + nginx route.
-sudo ip link del "tap-vm${VM_NUM}" 2>/dev/null || true
+# The tap must be this tenant's own. vm.json records the number of the tap the VM was
+# attached to (launch-vm.sh writes it; migrate-vm.sh restores the source's copy, the
+# tap baked into the snapshot), while callers pass DDB vm_num, which a migrate flips
+# to the target slot. Deleting tap-vm<arg> then would cut a live neighbour off the
+# network and purge its isolation rules, so only a vm.json naming this same number
+# lets stop touch the tap. A vm.json that is missing or unreadable proves nothing.
+_own_vm_num=$(python3 -c 'import json, sys
+v = json.load(open(sys.argv[1])).get("vm_num")
+print(v if type(v) is int else "")' "${VM_DIR}/vm.json" 2>/dev/null) || _own_vm_num=""
+_tap_state=not_ours
+if [ -n "${_own_vm_num}" ] && [ "${_own_vm_num}" = "${VM_NUM}" ]; then
+  sudo ip link del "tap-vm${VM_NUM}" 2>/dev/null || true
+  # Only once the tap is known to be gone: purging the isolation DROPs of a tap that
+  # is still up would leave it half-isolated. `ip link show <tap>` failing does not
+  # prove that (ip itself may fail), so list every link and look for the tap in the
+  # list. Only a listing and a parse that both succeed and say "absent" purge;
+  # anything else (ip or awk failing, an empty listing) keeps the rules.
+  _tap_state=unknown
+  if _links=$(sudo ip -o link show 2>/dev/null) && [ -n "${_links}" ]; then
+    _tap_state=$(awk -F': ' -v tap="tap-vm${VM_NUM}" \
+      '{ name = $2; sub(/@.*/, "", name); if (name == tap) found = 1 }
+       END { print (found ? "present" : "absent") }' <<<"${_links}") || _tap_state=unknown
+  fi
+fi
+case "${_tap_state}" in
+  absent) purge_tap_rules "tap-vm${VM_NUM}" ;;
+  present) log "WARN: tap-vm${VM_NUM} still exists after ip link del; keeping its iptables rules" ;;
+  not_ours) log "WARN: ${VM_DIR}/vm.json names tap-vm${_own_vm_num:-?}, not tap-vm${VM_NUM}; leaving every tap and its iptables rules" ;;
+  *) log "WARN: cannot tell whether tap-vm${VM_NUM} is gone; keeping its iptables rules" ;;
+esac
 rm -f "${VM_DIR}/fc.sock" "${VM_DIR}/fc.log"
 sudo rm -f "/etc/nginx/conf.d/tenants/${TENANT_ID}.conf"
 sudo nginx -s reload 2>/dev/null || true

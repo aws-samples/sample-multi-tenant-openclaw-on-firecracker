@@ -444,10 +444,11 @@ def release_port_and_dnat(bitmap: PortBitmap, host_port: int, guest_ip: str) -> 
 
     R2.3 reclaim boundary — only DELETE reclaims, STOP never does:
     this function is the single reclaim path (called on tenant delete). The
-    stop path (stop-vm.sh) deliberately deletes only the tap link + nginx conf
-    and leaves the DNAT rule, port bitmap entry, and `route:{tenant_id}` Redis
-    key intact, so a stopped tenant wakes on the SAME host_port with no
-    re-alloc (verified: stop-vm.sh touches no iptables/bitmap/Redis). Do NOT
+    stop path (stop-vm.sh) deliberately deletes only the tap link, the per-tap
+    `-i tap-vmN` filter/nat rules, and the nginx conf, and leaves the gateway
+    DNAT rule, port bitmap entry, and `route:{tenant_id}` Redis key intact, so a
+    stopped tenant wakes on the SAME host_port with no re-alloc (stop-vm.sh
+    never touches a rule without `-i tap-vmN`, the bitmap, or Redis). Do NOT
     add reclaim to the stop path — that would strand the route on wake.
 
     R5.3:release 后压 quarantine (PORT_QUARANTINE_SECONDS 冷却期),防迁移
